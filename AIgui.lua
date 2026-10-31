@@ -465,16 +465,38 @@ end
 
 --=====================================================================
 --  Notifications
---  Stacked top-right, auto-dismiss, click to close early.
+--
+--  Lives in its own ScreenGui so notifications still show while the menu is
+--  closed - that is usually when you want them.
 --=====================================================================
+local notifyGui = new("ScreenGui", {
+    Name = "AIgui_notify",
+    ResetOnSpawn = false,
+    IgnoreGuiInset = true,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    DisplayOrder = 1000,
+})
+notifyGui.Parent = getGuiParent()
+
+notifyGui.AncestryChanged:Connect(function()
+    if notifyGui.Parent or UI._destroyed then return end
+    task.defer(function()
+        if not notifyGui.Parent and not UI._destroyed then
+            notifyGui.Parent = getGuiParent()
+        end
+    end)
+end)
+UI.NotifyGui = notifyGui
+
+-- Y = 54 clears the Roblox topbar icons in the top-right corner
 local notifyHolder = new("Frame", {
     AnchorPoint = Vector2.new(1, 0),
-    Position = UDim2.new(1, -16, 0, 16),
+    Position = UDim2.new(1, -16, 0, 54),
     Size = UDim2.new(0, 220, 0, 0),
     AutomaticSize = Enum.AutomaticSize.Y,
     BackgroundTransparency = 1,
     ZIndex = 800,
-}, gui)
+}, notifyGui)
 
 new("UIListLayout", {
     Padding = UDim.new(0, 8),
@@ -484,6 +506,10 @@ new("UIListLayout", {
 
 local notifyOrder = 0
 
+-- The card is a plain Frame, NOT a CanvasGroup. A CanvasGroup renders its
+-- subtree into a layer that needs a concrete size; paired with AutomaticSize.Y
+-- it can settle at 0 height and stay invisible with no error at all.
+-- Transparency is animated per element instead.
 function UI.Notify(cfg)
     if type(cfg) ~= "table" then
         cfg = { Text = tostring(cfg) }
@@ -491,18 +517,18 @@ function UI.Notify(cfg)
 
     notifyOrder = notifyOrder + 1
 
-    -- CanvasGroup allows one tween for the whole card; a Frame needs every child
-    local card = new("CanvasGroup", {
+    local card = new("Frame", {
         LayoutOrder = notifyOrder,
         Size = UDim2.new(1, 0, 0, 0),
         AutomaticSize = Enum.AutomaticSize.Y,
         BackgroundColor3 = Theme.win,
+        BackgroundTransparency = 1,
         BorderSizePixel = 0,
-        GroupTransparency = 1,
         ZIndex = 801,
     }, notifyHolder)
     corner(card, 8)
-    stroke(card, Theme.line)
+    local edge = stroke(card, Theme.line)
+    edge.Transparency = 1
 
     new("UIPadding", {
         PaddingTop = UDim.new(0, 10),
@@ -516,8 +542,11 @@ function UI.Notify(cfg)
         SortOrder = Enum.SortOrder.LayoutOrder,
     }, card)
 
+    -- collected so fadeTo() can animate everything together
+    local texts = {}
+
     if cfg.Title then
-        new("TextLabel", {
+        texts[#texts + 1] = new("TextLabel", {
             LayoutOrder = 1,
             Size = UDim2.new(1, 0, 0, 0),
             AutomaticSize = Enum.AutomaticSize.Y,
@@ -526,12 +555,15 @@ function UI.Notify(cfg)
             Font = Theme.fontMedium,
             TextSize = Theme.textSize,
             TextColor3 = Theme.text,
+            TextTransparency = 1,
             TextXAlignment = Enum.TextXAlignment.Left,
+            TextYAlignment = Enum.TextYAlignment.Top,
             TextWrapped = true,
+            ZIndex = 802,
         }, card)
     end
 
-    new("TextLabel", {
+    texts[#texts + 1] = new("TextLabel", {
         LayoutOrder = 2,
         Size = UDim2.new(1, 0, 0, 0),
         AutomaticSize = Enum.AutomaticSize.Y,
@@ -540,21 +572,33 @@ function UI.Notify(cfg)
         Font = Theme.font,
         TextSize = 11,
         TextColor3 = Theme.text2,
+        TextTransparency = 1,
         TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
         TextWrapped = true,
+        ZIndex = 802,
     }, card)
 
     local closed = false
+
+    local function fadeTo(alpha, duration)
+        tween(card, duration, { BackgroundTransparency = alpha })
+        tween(edge, duration, { Transparency = alpha })
+        for _, t in ipairs(texts) do
+            tween(t, duration, { TextTransparency = alpha })
+        end
+    end
+
     local function close()
         if closed then return end
         closed = true
-        local t = tween(card, 0.15, { GroupTransparency = 1 })
-        t.Completed:Connect(function()
+        fadeTo(1, 0.15)
+        task.delay(0.16, function()
             card:Destroy()
         end)
     end
 
-    tween(card, 0.18, { GroupTransparency = 0 })
+    fadeTo(0, 0.18)
     task.delay(cfg.Duration or 3, close)
 
     local hit = new("TextButton", {
@@ -562,7 +606,7 @@ function UI.Notify(cfg)
         BackgroundTransparency = 1,
         Text = "",
         AutoButtonColor = false,
-        ZIndex = 3,
+        ZIndex = 850,
     }, card)
     hit.MouseButton1Click:Connect(close)
 
@@ -1896,6 +1940,8 @@ function UI.Destroy()
     table.clear(UI.Windows)
     pcall(function() RunService:UnbindFromRenderStep(MOUSE_BIND) end)
     gui:Destroy()
+    -- Notifications live in a second ScreenGui, so they need their own teardown
+    pcall(function() notifyGui:Destroy() end)
 end
 
 --=====================================================================
