@@ -196,18 +196,83 @@ local blocker = new("TextButton", {
 
 --=====================================================================
 --  Mouse unlocking
+--
+--  Why setting MouseBehavior once does not work:
+--    Games lock the cursor by writing MouseBehavior = LockCenter every frame,
+--    usually from a camera controller on RenderPriority.Last (2000). A single
+--    write, or one from a plain RenderStepped, is overwritten in the same
+--    frame and the cursor vanishes again.
+--
+--  Three layers, most reliable first:
+--    1. GetPropertyChangedSignal - the moment the game writes, we write back.
+--       Independent of frame order, catches locks from any phase.
+--    2. Heartbeat - runs after every RenderStepped, catches writes that did
+--       not fire the signal for whatever reason.
+--    3. BindToRenderStep(Last) - final net for camera controllers.
+--
+--  The priority is Last (2000), NOT Last + 1. Priorities above 2000 are
+--  clamped back to 2000, which silently dropped us into the same bucket as
+--  the camera and made the write order a coin flip.
 --=====================================================================
 local MOUSE_BIND = "AIgui_mouse"
 local mouseUnlocked = false
 local autoUnlock    = true
-local unlockPrio    = Enum.RenderPriority.Last.Value + 1
+local unlockPrio    = Enum.RenderPriority.Last.Value
 local savedBehavior, savedIcon = nil, nil
+local mouseConns   = {}
+local writingMouse = false
+
+-- Named rather than inline, so pcall can take the function itself instead of
+-- allocating a new closure on every Heartbeat tick.
+local function applyMouse()
+    -- Compare before writing: assigning the same value still fires the changed
+    -- signal, which would re-enter this path through the handlers below.
+    if UIS.MouseBehavior ~= Enum.MouseBehavior.Default then
+        UIS.MouseBehavior = Enum.MouseBehavior.Default
+    end
+    if not UIS.MouseIconEnabled then
+        UIS.MouseIconEnabled = true
+    end
+end
 
 local function writeMouse()
+    if writingMouse then return end
+    writingMouse = true
+    pcall(applyMouse)
+    writingMouse = false
+end
+
+local function bindRenderStep()
+    pcall(function() RunService:UnbindFromRenderStep(MOUSE_BIND) end)
     pcall(function()
-        UIS.MouseBehavior    = Enum.MouseBehavior.Default
-        UIS.MouseIconEnabled = true
+        RunService:BindToRenderStep(MOUSE_BIND, unlockPrio, function()
+            if mouseUnlocked then writeMouse() end
+        end)
     end)
+end
+
+local function startHold()
+    if #mouseConns > 0 then return end
+
+    mouseConns[#mouseConns + 1] = UIS:GetPropertyChangedSignal("MouseBehavior"):Connect(function()
+        if mouseUnlocked then writeMouse() end
+    end)
+    mouseConns[#mouseConns + 1] = UIS:GetPropertyChangedSignal("MouseIconEnabled"):Connect(function()
+        if mouseUnlocked then writeMouse() end
+    end)
+    mouseConns[#mouseConns + 1] = RunService.Heartbeat:Connect(function()
+        if mouseUnlocked then writeMouse() end
+    end)
+
+    bindRenderStep()
+end
+
+local function stopHold()
+    for _, c in ipairs(mouseConns) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(mouseConns)
+    pcall(function() RunService:UnbindFromRenderStep(MOUSE_BIND) end)
 end
 
 function UI.SetAutoUnlockMouse(v)
@@ -216,12 +281,7 @@ end
 
 function UI.SetUnlockPriority(n)
     unlockPrio = n
-    if mouseUnlocked then
-        pcall(function() RunService:UnbindFromRenderStep(MOUSE_BIND) end)
-        RunService:BindToRenderStep(MOUSE_BIND, unlockPrio, function()
-            if mouseUnlocked then writeMouse() end
-        end)
-    end
+    if mouseUnlocked then bindRenderStep() end
 end
 
 function UI.SetMouseUnlocked(on)
@@ -230,22 +290,21 @@ function UI.SetMouseUnlocked(on)
     mouseUnlocked = on
 
     if on then
-        -- Record the original state only on the first open. Otherwise, after a few
-        -- toggles you would capture Default and never lock back on close.
+        -- Record the original state only on the first unlock. Capturing it on
+        -- every open would store Default and never lock back on close.
         if savedBehavior == nil then
             savedBehavior = UIS.MouseBehavior
             savedIcon     = UIS.MouseIconEnabled
         end
-        pcall(function() RunService:UnbindFromRenderStep(MOUSE_BIND) end)
-        RunService:BindToRenderStep(MOUSE_BIND, unlockPrio, function()
-            if mouseUnlocked then writeMouse() end
-        end)
+        startHold()
         writeMouse()
     else
-        pcall(function() RunService:UnbindFromRenderStep(MOUSE_BIND) end)
+        -- Detach before writing. Otherwise the restore itself fires the
+        -- changed signal and the handler snaps it straight back to Default.
+        stopHold()
         pcall(function()
-            UIS.MouseBehavior    = savedBehavior or Enum.MouseBehavior.LockCenter
             UIS.MouseIconEnabled = (savedIcon ~= false)
+            UIS.MouseBehavior    = savedBehavior or Enum.MouseBehavior.LockCenter
         end)
         savedBehavior, savedIcon = nil, nil
     end
@@ -253,6 +312,17 @@ end
 
 function UI.IsMouseUnlocked()
     return mouseUnlocked
+end
+
+-- Diagnostics: useful when a game refuses to release the cursor.
+function UI.GetMouseState()
+    return {
+        unlocked    = mouseUnlocked,
+        behavior    = UIS.MouseBehavior,
+        iconEnabled = UIS.MouseIconEnabled,
+        auto        = autoUnlock,
+        priority    = unlockPrio,
+    }
 end
 
 --=====================================================================
@@ -1742,8 +1812,12 @@ function UI.SetMenuOpen(v)
     UI.MenuOpen = v
     gui.Enabled    = v
     blocker.Visible = v
-    if autoUnlock then
-        UI.SetMouseUnlocked(v)
+    if v then
+        if autoUnlock then UI.SetMouseUnlocked(true) end
+    else
+        -- Always release on close. If auto-unlock was switched off while the
+        -- menu was open, skipping this leaves the cursor unlocked forever.
+        UI.SetMouseUnlocked(false)
     end
     if not v then closeDropdown() end
 end
