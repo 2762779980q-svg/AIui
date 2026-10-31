@@ -88,6 +88,7 @@ local M = {
     bodyTop = 3,
     bodyBot = 8,
     radius  = 8,
+    notifyW = 220,   -- notification card width
 }
 
 --=====================================================================
@@ -521,20 +522,18 @@ local notifyOrder = 0
 -- Transparency is animated per element instead.
 -- Exact wrapped height via TextService. Falls back to a rough estimate when
 -- it is unavailable, so a card never collapses to nothing.
-local NOTIFY_W      = 220
-local NOTIFY_PAD_X  = 12
-local NOTIFY_PAD_Y  = 10
-local NOTIFY_TEXT_W = NOTIFY_W - NOTIFY_PAD_X * 2
+local NOTIFY_PAD_X = 12
+local NOTIFY_PAD_Y = 10
 
-local function measureText(text, size, font)
+local function measureText(text, size, font, maxWidth)
     if text == nil or text == "" then return 0 end
     local ok, bounds = pcall(function()
-        return TextService:GetTextSize(text, size, font, Vector2.new(NOTIFY_TEXT_W, 100000))
+        return TextService:GetTextSize(text, size, font, Vector2.new(maxWidth, 100000))
     end)
     if ok and bounds and bounds.Y > 0 then
         return math.ceil(bounds.Y)
     end
-    local perLine = math.max(1, math.floor(NOTIFY_TEXT_W / (size * 0.58)))
+    local perLine = math.max(1, math.floor(maxWidth / (size * 0.58)))
     return math.max(1, math.ceil(#text / perLine)) * math.ceil(size * 1.35)
 end
 
@@ -545,6 +544,8 @@ function UI.Notify(cfg)
 
     notifyOrder = notifyOrder + 1
 
+    local cardW    = M.notifyW or 220
+    local textW    = cardW - NOTIFY_PAD_X * 2
     local titleStr = cfg.Title and tostring(cfg.Title) or nil
     local bodyStr  = tostring(cfg.Text or "")
 
@@ -553,14 +554,14 @@ function UI.Notify(cfg)
     -- against a 0-wide first frame; every character then wraps onto its own
     -- line and the card grows to several hundred pixels while looking empty.
     -- Measuring first makes the size deterministic.
-    local titleH = titleStr and measureText(titleStr, Theme.textSize, Theme.fontMedium) or 0
-    local bodyH  = measureText(bodyStr, 11, Theme.font)
+    local titleH = titleStr and measureText(titleStr, Theme.textSize, Theme.fontMedium, textW) or 0
+    local bodyH  = measureText(bodyStr, 11, Theme.font, textW)
     local gapH   = (titleStr and titleH > 0) and 3 or 0
     local cardH  = NOTIFY_PAD_Y * 2 + titleH + gapH + bodyH
 
     local card = new("Frame", {
         LayoutOrder = notifyOrder,
-        Size = UDim2.fromOffset(NOTIFY_W, cardH),
+        Size = UDim2.fromOffset(cardW, cardH),
         BackgroundColor3 = Theme.win,
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
@@ -575,7 +576,7 @@ function UI.Notify(cfg)
 
     if titleStr then
         texts[#texts + 1] = new("TextLabel", {
-            Size = UDim2.fromOffset(NOTIFY_TEXT_W, titleH),
+            Size = UDim2.fromOffset(textW, titleH),
             Position = UDim2.fromOffset(NOTIFY_PAD_X, NOTIFY_PAD_Y),
             BackgroundTransparency = 1,
             Text = titleStr,
@@ -592,7 +593,7 @@ function UI.Notify(cfg)
 
     if bodyStr ~= "" then
         texts[#texts + 1] = new("TextLabel", {
-            Size = UDim2.fromOffset(NOTIFY_TEXT_W, bodyH),
+            Size = UDim2.fromOffset(textW, bodyH),
             Position = UDim2.fromOffset(NOTIFY_PAD_X, NOTIFY_PAD_Y + titleH + gapH),
             BackgroundTransparency = 1,
             Text = bodyStr,
@@ -645,7 +646,16 @@ end
 --  Colour picker popup
 --  12 preset swatches + three RGB bars, all firing the callback live.
 --=====================================================================
-local CP_W, CP_H = 172, 132
+local CP_PAD   = 10
+local CP_W     = 200
+local CP_SV    = CP_W - CP_PAD * 2   -- 180
+local CP_SVH   = 132
+local CP_BAR   = 12
+local CP_SV_Y    = CP_PAD
+local CP_HUE_Y   = CP_SV_Y + CP_SVH + 10
+local CP_ALPHA_Y = CP_HUE_Y + CP_BAR + 8
+local CP_PREV_Y  = CP_ALPHA_Y + CP_BAR + 10
+local CP_H       = CP_PREV_Y + 16 + CP_PAD
 
 local colorPicker = new("Frame", {
     Visible = false,
@@ -658,129 +668,250 @@ local colorPicker = new("Frame", {
 corner(colorPicker, 8)
 stroke(colorPicker, Theme.line)
 
-local cpTarget = nil      -- swatch button currently being edited
-local cpCallback = nil
-local cpRGB = { 1, 1, 1 }
+local cpTarget, cpCallback, cpDrag = nil, nil, nil
+local cpH, cpS, cpV, cpA = 0, 1, 1, 0
+local cpLastHue = 0   -- keeping the hue across greys, otherwise picking a
+                      -- grey collapses the hue back to red every time
 
-local PRESETS = {
-    Color3.fromRGB(255, 255, 255), Color3.fromRGB(200, 200, 206),
-    Color3.fromRGB(120, 120, 128), Color3.fromRGB( 60,  60,  66),
-    Color3.fromRGB(255,  92,  92), Color3.fromRGB(255, 168,  64),
-    Color3.fromRGB(255, 226,  88), Color3.fromRGB(112, 208, 116),
-    Color3.fromRGB( 88, 196, 200), Color3.fromRGB( 92, 148, 255),
-    Color3.fromRGB(160, 120, 240), Color3.fromRGB(240, 120, 190),
-}
+--  Saturation / value square.
+--  There is no built-in widget for this, so it is three stacked frames:
+--    1. the pure hue as background
+--    2. white, fading out to the right   -> saturation
+--    3. black, fading out towards the top -> value
+--  A GuiObject only accepts one UIGradient, hence the stacking.
+local svBox = new("Frame", {
+    Position = UDim2.fromOffset(CP_PAD, CP_PAD),
+    Size = UDim2.fromOffset(CP_SV, CP_SVH),
+    BackgroundColor3 = Color3.fromHSV(0, 1, 1),
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+    ZIndex = 522,
+}, colorPicker)
+corner(svBox, 4)
 
--- preview strip
-local cpPreview = new("Frame", {
-    Position = UDim2.fromOffset(10, 96),
-    Size = UDim2.fromOffset(CP_W - 20, 8),
+local satLayer = new("Frame", {
+    Size = UDim2.fromScale(1, 1),
     BackgroundColor3 = Color3.new(1, 1, 1),
     BorderSizePixel = 0,
+    ZIndex = 523,
+}, svBox)
+new("UIGradient", {
+    Rotation = 0,
+    Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0),
+        NumberSequenceKeypoint.new(1, 1),
+    }),
+}, satLayer)
+
+local valLayer = new("Frame", {
+    Size = UDim2.fromScale(1, 1),
+    BackgroundColor3 = Color3.new(0, 0, 0),
+    BorderSizePixel = 0,
+    ZIndex = 524,
+}, svBox)
+new("UIGradient", {
+    Rotation = 90,
+    Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 1),
+        NumberSequenceKeypoint.new(1, 0),
+    }),
+}, valLayer)
+
+-- Knobs live on the popup, not inside the square/bars. Those containers clip
+-- to their rounded corners, which would slice the knob in half at the edges.
+local svKnob = new("Frame", {
+    Size = UDim2.fromOffset(12, 12),
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    BackgroundTransparency = 1,
+    ZIndex = 530,
 }, colorPicker)
-corner(cpPreview, 0.5)
+stroke(svKnob, Color3.new(1, 1, 1), 2)
+
+--  Hue bar
+local hueBar = new("Frame", {
+    Position = UDim2.fromOffset(CP_PAD, CP_HUE_Y),
+    Size = UDim2.fromOffset(CP_SV, CP_BAR),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+    ZIndex = 522,
+}, colorPicker)
+corner(hueBar, 0.5)
+new("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0.000, Color3.fromRGB(255,   0,   0)),
+        ColorSequenceKeypoint.new(0.167, Color3.fromRGB(255, 255,   0)),
+        ColorSequenceKeypoint.new(0.333, Color3.fromRGB(  0, 255,   0)),
+        ColorSequenceKeypoint.new(0.500, Color3.fromRGB(  0, 255, 255)),
+        ColorSequenceKeypoint.new(0.667, Color3.fromRGB(  0,   0, 255)),
+        ColorSequenceKeypoint.new(0.833, Color3.fromRGB(255,   0, 255)),
+        ColorSequenceKeypoint.new(1.000, Color3.fromRGB(255,   0,   0)),
+    }),
+}, hueBar)
+
+local hueKnob = new("Frame", {
+    Size = UDim2.fromOffset(5, CP_BAR + 6),
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0,
+    ZIndex = 530,
+}, colorPicker)
+corner(hueKnob, 2)
+stroke(hueKnob, Color3.fromRGB(120, 120, 128), 1)
+
+--  Alpha bar: white underneath, current colour fading to transparent on top
+local alphaBar = new("Frame", {
+    Position = UDim2.fromOffset(CP_PAD, CP_ALPHA_Y),
+    Size = UDim2.fromOffset(CP_SV, CP_BAR),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+    ZIndex = 522,
+}, colorPicker)
+corner(alphaBar, 0.5)
+
+local alphaFill = new("Frame", {
+    Size = UDim2.fromScale(1, 1),
+    BackgroundColor3 = Color3.fromHSV(0, 0, 0),
+    BorderSizePixel = 0,
+    ZIndex = 523,
+}, alphaBar)
+corner(alphaFill, 0.5)
+new("UIGradient", {
+    Rotation = 0,
+    Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0),
+        NumberSequenceKeypoint.new(1, 1),
+    }),
+}, alphaFill)
+
+local alphaKnob = new("Frame", {
+    Size = UDim2.fromOffset(5, CP_BAR + 6),
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0,
+    ZIndex = 530,
+}, colorPicker)
+corner(alphaKnob, 2)
+stroke(alphaKnob, Color3.fromRGB(120, 120, 128), 1)
+
+--  Preview strip: opaque white base with the chosen colour on top
+local cpPreview = new("Frame", {
+    Position = UDim2.fromOffset(CP_PAD, CP_PREV_Y),
+    Size = UDim2.fromOffset(CP_SV, 16),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+    ZIndex = 522,
+}, colorPicker)
+corner(cpPreview, 3)
 stroke(cpPreview, Theme.line, 1)
 
-local function cpApplyColor(c, fire)
-    if not c then return end
-    cpRGB = { c.R, c.G, c.B }
-    cpPreview.BackgroundColor3 = c
+local cpPreviewFill = new("Frame", {
+    Size = UDim2.fromScale(1, 1),
+    BackgroundColor3 = Color3.fromHSV(0, 0, 0),
+    BorderSizePixel = 0,
+    ZIndex = 523,
+}, cpPreview)
+corner(cpPreviewFill, 3)
+
+local function cpApply(fire)
+    cpLastHue = cpH
+    local c = Color3.fromHSV(cpH, cpS, cpV)
+
+    svBox.BackgroundColor3      = Color3.fromHSV(cpH, 1, 1)
+    alphaFill.BackgroundColor3  = c
+    cpPreviewFill.BackgroundColor3    = c
+    cpPreviewFill.BackgroundTransparency = cpA
+
+    svKnob.Position = UDim2.fromOffset(
+        CP_PAD + cpS * CP_SV,
+        CP_SV_Y + (1 - cpV) * CP_SVH)
+    hueKnob.Position = UDim2.fromOffset(
+        CP_PAD + cpH * CP_SV,
+        CP_HUE_Y + CP_BAR / 2)
+    alphaKnob.Position = UDim2.fromOffset(
+        CP_PAD + cpA * CP_SV,
+        CP_ALPHA_Y + CP_BAR / 2)
+
     if cpTarget then
-        cpTarget.BackgroundColor3 = c
+        cpTarget.BackgroundColor3        = c
+        cpTarget.BackgroundTransparency  = cpA
     end
+
     if fire and cpCallback then
-        local ok, err = pcall(cpCallback, c)
+        local ok, err = pcall(cpCallback, c, cpA)
         if not ok then reportError("colorpicker", err) end
     end
 end
 
--- 12 preset swatches (6 columns x 2 rows)
-for i, c in ipairs(PRESETS) do
-    local col = (i - 1) % 6
-    local row = math.floor((i - 1) / 6)
-    local sw = new("TextButton", {
-        Size = UDim2.fromOffset(22, 22),
-        Position = UDim2.fromOffset(10 + col * 26, 10 + row * 26),
-        BackgroundColor3 = c,
-        BorderSizePixel = 0,
-        Text = "",
-        AutoButtonColor = false,
-        ZIndex = 522,
-    }, colorPicker)
-    corner(sw, 4)
-    stroke(sw, Theme.line, 1)
-
-    sw.MouseButton1Click:Connect(function()
-        cpApplyColor(c, true)
-    end)
-end
-
--- three mini RGB bars
-local cpBars = {}
-local cpDragBar = nil
-
-local function makeBar(y, channel, init)
-    local bar = new("Frame", {
-        Size = UDim2.fromOffset(CP_W - 20, 4),
-        Position = UDim2.fromOffset(10, y),
-        BackgroundColor3 = Theme.ctrl,
-        BorderSizePixel = 0,
-        ZIndex = 522,
-    }, colorPicker)
-    corner(bar, 0.5)
-
-    local fill = new("Frame", {
-        Size = UDim2.fromScale(init, 1),
-        BackgroundColor3 = Theme.accentDim,
-        BorderSizePixel = 0,
-        ZIndex = 523,
-    }, bar)
-    corner(fill, 0.5)
-
+-- Hit areas are taller than the bars so a thin 12px strip is still grabbable
+local function hitArea(parent, height, yOff)
     local hit = new("TextButton", {
-        Size = UDim2.new(1, 0, 0, 12),
-        Position = UDim2.fromOffset(0, -4),
+        Size = UDim2.new(1, 0, 0, height),
+        Position = UDim2.fromOffset(0, yOff),
         BackgroundTransparency = 1,
         Text = "",
         AutoButtonColor = false,
-        ZIndex = 524,
-    }, bar)
+        ZIndex = 535,
+    }, parent)
+    return hit
+end
 
-    local rec = { track = bar, fill = fill, ch = channel }
-    rec.update = function(clientX)
-        local abs = bar.AbsolutePosition
-        local wpx = bar.AbsoluteSize.X
-        if wpx <= 0 then return end
-        local p = math.clamp((clientX - abs.X) / wpx, 0, 1)
-        fill.Size = UDim2.fromScale(p, 1)
-        cpRGB[channel] = p
-        cpApplyColor(Color3.new(cpRGB[1], cpRGB[2], cpRGB[3]), true)
-    end
+local function svUpdate(x, y)
+    local abs, sz = svBox.AbsolutePosition, svBox.AbsoluteSize
+    if sz.X <= 0 or sz.Y <= 0 then return end
+    cpS = math.clamp((x - abs.X) / sz.X, 0, 1)
+    cpV = 1 - math.clamp((y - abs.Y) / sz.Y, 0, 1)
+    cpApply(true)
+end
 
+local function hueUpdate(x)
+    local abs, w = hueBar.AbsolutePosition, hueBar.AbsoluteSize.X
+    if w <= 0 then return end
+    local h = math.clamp((x - abs.X) / w, 0, 1)
+    -- 1.0 and 0.0 are the same hue, but the knob would jump back to the left
+    if h >= 0.999 then h = 0.999 end
+    cpH = h
+    cpApply(true)
+end
+
+local function alphaUpdate(x)
+    local abs, w = alphaBar.AbsolutePosition, alphaBar.AbsoluteSize.X
+    if w <= 0 then return end
+    cpA = math.clamp((x - abs.X) / w, 0, 1)
+    cpApply(true)
+end
+
+local svHit = hitArea(svBox,    CP_SVH, 0)
+local hueHit = hitArea(hueBar,  24, -6)
+local alphaHit = hitArea(alphaBar, 24, -6)
+
+local function bindDrag(hit, fn)
     hit.InputBegan:Connect(function(input)
         if input.UserInputType ~= Enum.UserInputType.MouseButton1
            and input.UserInputType ~= Enum.UserInputType.Touch then return end
-        cpDragBar = rec
-        rec.update(input.Position.X)
+        cpDrag = fn
+        fn(input.Position.X, input.Position.Y)
     end)
-
-    cpBars[channel] = rec
-    return bar
 end
 
-makeBar(60, 1, 1)
-makeBar(70, 2, 1)
-makeBar(80, 3, 1)
+bindDrag(svHit, svUpdate)
+bindDrag(hueHit, hueUpdate)
+bindDrag(alphaHit, alphaUpdate)
 
 UIS.InputChanged:Connect(function(input)
-    if not cpDragBar then return end
+    if not cpDrag then return end
     if input.UserInputType == Enum.UserInputType.MouseMovement
        or input.UserInputType == Enum.UserInputType.Touch then
-        cpDragBar.update(input.Position.X)
+        cpDrag(input.Position.X, input.Position.Y)
     end
 end)
-UIS.InputEnded:Connect(function()
-    cpDragBar = nil
+UIS.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+       or input.UserInputType == Enum.UserInputType.Touch then
+        cpDrag = nil
+    end
 end)
 
 closeColorPicker = function()
@@ -788,6 +919,7 @@ closeColorPicker = function()
     veil.Visible = false
     cpTarget = nil
     cpCallback = nil
+    cpDrag = nil
 end
 
 local function openColorPicker(anchor, current, callback)
@@ -807,12 +939,15 @@ local function openColorPicker(anchor, current, callback)
     cpTarget   = anchor
     cpCallback = callback
 
-    for ch = 1, 3 do
-        local rec = cpBars[ch]
-        local v = (current and ({ current.R, current.G, current.B })[ch]) or 1
-        rec.fill.Size = UDim2.fromScale(v, 1)
-    end
-    cpApplyColor(current or Color3.new(1, 1, 1), false)
+    local c = current or Color3.new(1, 1, 1)
+    local h, s, v = c:ToHSV()
+    -- pure greys have no meaningful hue; keep the previous one so the
+    -- square does not snap to red while the user drags saturation
+    cpH = (s > 0.001) and h or cpLastHue
+    cpS = s
+    cpV = v
+    cpA = anchor.BackgroundTransparency or 0
+    cpApply(false)
 end
 
 -- Multi-select popup: reuses the dropdown container, toggles without closing
@@ -1645,11 +1780,13 @@ function Window:ColorPicker(cfg)
     }, row)
 
     local color = cfg.Default or Color3.new(1, 1, 1)
+    local alpha = cfg.Alpha or 0
 
     local swatch = new("TextButton", {
-        Size = UDim2.fromOffset(34, 18),
-        Position = UDim2.new(1, -46, 0.5, -9),
+        Size = UDim2.fromOffset(38, 18),
+        Position = UDim2.new(1, -50, 0.5, -9),
         BackgroundColor3 = color,
+        BackgroundTransparency = alpha,
         BorderSizePixel = 0,
         Text = "",
         AutoButtonColor = false,
@@ -1657,22 +1794,26 @@ function Window:ColorPicker(cfg)
     corner(swatch, 4)
     stroke(swatch, Theme.line)
 
+    -- The callback gets (colour, alpha). Existing code that only takes the
+    -- first argument keeps working unchanged.
     swatch.MouseButton1Click:Connect(function()
-        openColorPicker(swatch, color, function(c)
-            color = c
+        openColorPicker(swatch, color, function(c, a)
+            color, alpha = c, a or 0
             if cfg.Callback then
-                local ok, err = pcall(cfg.Callback, c)
+                local ok, err = pcall(cfg.Callback, c, a)
                 if not ok then reportError("colorpicker", err) end
             end
         end)
     end)
 
     return {
-        Set = function(_, c)
+        Set = function(_, c, a)
             color = c
+            alpha = a or 0
             swatch.BackgroundColor3 = c
+            swatch.BackgroundTransparency = alpha
         end,
-        Get = function() return color end,
+        Get = function() return color, alpha end,
     }
 end
 
@@ -1817,17 +1958,22 @@ end
 function Window:SetTitle(text, subtitle)
     self.title = text or self.title
     if subtitle ~= nil then self.subtitle = subtitle end
-    -- The title is a child of the UIListLayout; find the first TextLabel
+
+    -- Title and subtitle hang off a UIListLayout, ordered 1 and 2.
+    -- Both have to be written: updating only the first leaves a stale subtitle.
     local box = self.head:FindFirstChildOfClass("Frame")
-    if box then
-        local labels = box:GetChildren()
-        for _, o in ipairs(labels) do
-            if o:IsA("TextLabel") and o.LayoutOrder == 1 then
+    if not box then return self end
+
+    for _, o in ipairs(box:GetChildren()) do
+        if o:IsA("TextLabel") then
+            if o.LayoutOrder == 1 then
                 o.Text = self.title
-                break
+            elseif o.LayoutOrder == 2 and self.subtitle then
+                o.Text = self.subtitle
             end
         end
     end
+    return self
 end
 
 function Window:Destroy()
