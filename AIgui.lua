@@ -215,8 +215,10 @@ local blocker = new("TextButton", {
 --  the camera and made the write order a coin flip.
 --=====================================================================
 local MOUSE_BIND = "AIgui_mouse"
-local mouseUnlocked = false
-local autoUnlock    = true
+local mouseUnlocked  = false
+local autoUnlock     = true
+local rightHoldLook  = true    -- hold RMB to look around while the menu is open
+local rightHeld      = false
 local unlockPrio    = Enum.RenderPriority.Last.Value
 local savedBehavior, savedIcon = nil, nil
 local mouseConns   = {}
@@ -225,17 +227,33 @@ local writingMouse = false
 -- Named rather than inline, so pcall can take the function itself instead of
 -- allocating a new closure on every Heartbeat tick.
 local function applyMouse()
+    if not mouseUnlocked then return end
+
     -- Compare before writing: assigning the same value still fires the changed
     -- signal, which would re-enter this path through the handlers below.
-    if UIS.MouseBehavior ~= Enum.MouseBehavior.Default then
-        UIS.MouseBehavior = Enum.MouseBehavior.Default
-    end
-    if not UIS.MouseIconEnabled then
-        UIS.MouseIconEnabled = true
+    if rightHeld and rightHoldLook then
+        -- Right button held: snap back to LockCenter. The game camera only
+        -- receives mouse delta while the cursor is centred, so this is what
+        -- makes "hold right button to look around" work with the menu open.
+        -- The cursor parks itself in the middle of the screen on release.
+        if UIS.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
+            UIS.MouseBehavior = Enum.MouseBehavior.LockCenter
+        end
+        if UIS.MouseIconEnabled then
+            UIS.MouseIconEnabled = false
+        end
+    else
+        if UIS.MouseBehavior ~= Enum.MouseBehavior.Default then
+            UIS.MouseBehavior = Enum.MouseBehavior.Default
+        end
+        if not UIS.MouseIconEnabled then
+            UIS.MouseIconEnabled = true
+        end
     end
 end
 
 local function writeMouse()
+    if not mouseUnlocked then return end
     if writingMouse then return end
     writingMouse = true
     pcall(applyMouse)
@@ -264,6 +282,22 @@ local function startHold()
         if mouseUnlocked then writeMouse() end
     end)
 
+    -- Right button: temporarily hand the cursor back to the game so the camera
+    -- can turn. gameProcessed is deliberately ignored - holding RMB on top of a
+    -- window should still let you look around.
+    mouseConns[#mouseConns + 1] = UIS.InputBegan:Connect(function(input)
+        if not mouseUnlocked or not rightHoldLook then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseButton2 then return end
+        rightHeld = true
+        writeMouse()
+    end)
+    mouseConns[#mouseConns + 1] = UIS.InputEnded:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.MouseButton2 then return end
+        if not rightHeld then return end
+        rightHeld = false
+        writeMouse()
+    end)
+
     bindRenderStep()
 end
 
@@ -284,6 +318,15 @@ function UI.SetUnlockPriority(n)
     if mouseUnlocked then bindRenderStep() end
 end
 
+-- Hold RMB to look around while the menu is open. On by default.
+function UI.SetRightHoldLook(v)
+    rightHoldLook = v and true or false
+    if not rightHoldLook then
+        rightHeld = false
+        writeMouse()
+    end
+end
+
 function UI.SetMouseUnlocked(on)
     on = on and true or false
     if on == mouseUnlocked then return end
@@ -301,6 +344,7 @@ function UI.SetMouseUnlocked(on)
     else
         -- Detach before writing. Otherwise the restore itself fires the
         -- changed signal and the handler snaps it straight back to Default.
+        rightHeld = false
         stopHold()
         pcall(function()
             UIS.MouseIconEnabled = (savedIcon ~= false)
@@ -321,6 +365,8 @@ function UI.GetMouseState()
         behavior    = UIS.MouseBehavior,
         iconEnabled = UIS.MouseIconEnabled,
         auto        = autoUnlock,
+        rightHeld   = rightHeld,
+        rightLook   = rightHoldLook,
         priority    = unlockPrio,
     }
 end
@@ -1483,7 +1529,8 @@ function Window:Input(cfg)
         TextColor3 = Theme.text,
         TextXAlignment = Enum.TextXAlignment.Left,
         ClearTextOnFocus = false,
-        AutoButtonColor = false,
+        -- No AutoButtonColor here: that property only exists on GuiButton.
+        -- Setting it on a TextBox throws "not a valid member" and aborts creation.
     }, row)
     corner(box, 5)
     new("UIPadding", { PaddingLeft = UDim.new(0, 7) }, box)
