@@ -43,6 +43,7 @@ local Players      = game:GetService("Players")
 local UIS          = game:GetService("UserInputService")
 local RunService   = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
+local TextService  = game:GetService("TextService")
 local LocalPlayer  = Players.LocalPlayer
 
 --=====================================================================
@@ -155,6 +156,14 @@ UI.Theme    = Theme
 UI.Metrics  = M
 UI.MenuOpen = true
 UI._destroyed = false
+UI.LastError = nil
+
+-- Callbacks are user code and may throw. We swallow the error instead of
+-- printing: a widget callback firing every frame would flood the console.
+-- The last one is kept here so you can inspect it on demand.
+local function reportError(where, err)
+    UI.LastError = "[" .. tostring(where) .. "] " .. tostring(err)
+end
 
 --=====================================================================
 --  Root container
@@ -510,6 +519,25 @@ local notifyOrder = 0
 -- subtree into a layer that needs a concrete size; paired with AutomaticSize.Y
 -- it can settle at 0 height and stay invisible with no error at all.
 -- Transparency is animated per element instead.
+-- Exact wrapped height via TextService. Falls back to a rough estimate when
+-- it is unavailable, so a card never collapses to nothing.
+local NOTIFY_W      = 220
+local NOTIFY_PAD_X  = 12
+local NOTIFY_PAD_Y  = 10
+local NOTIFY_TEXT_W = NOTIFY_W - NOTIFY_PAD_X * 2
+
+local function measureText(text, size, font)
+    if text == nil or text == "" then return 0 end
+    local ok, bounds = pcall(function()
+        return TextService:GetTextSize(text, size, font, Vector2.new(NOTIFY_TEXT_W, 100000))
+    end)
+    if ok and bounds and bounds.Y > 0 then
+        return math.ceil(bounds.Y)
+    end
+    local perLine = math.max(1, math.floor(NOTIFY_TEXT_W / (size * 0.58)))
+    return math.max(1, math.ceil(#text / perLine)) * math.ceil(size * 1.35)
+end
+
 function UI.Notify(cfg)
     if type(cfg) ~= "table" then
         cfg = { Text = tostring(cfg) }
@@ -517,10 +545,22 @@ function UI.Notify(cfg)
 
     notifyOrder = notifyOrder + 1
 
+    local titleStr = cfg.Title and tostring(cfg.Title) or nil
+    local bodyStr  = tostring(cfg.Text or "")
+
+    -- Height is measured up front instead of being left to AutomaticSize.
+    -- A TextWrapped label inside an AutomaticSize container can be laid out
+    -- against a 0-wide first frame; every character then wraps onto its own
+    -- line and the card grows to several hundred pixels while looking empty.
+    -- Measuring first makes the size deterministic.
+    local titleH = titleStr and measureText(titleStr, Theme.textSize, Theme.fontMedium) or 0
+    local bodyH  = measureText(bodyStr, 11, Theme.font)
+    local gapH   = (titleStr and titleH > 0) and 3 or 0
+    local cardH  = NOTIFY_PAD_Y * 2 + titleH + gapH + bodyH
+
     local card = new("Frame", {
         LayoutOrder = notifyOrder,
-        Size = UDim2.new(1, 0, 0, 0),
-        AutomaticSize = Enum.AutomaticSize.Y,
+        Size = UDim2.fromOffset(NOTIFY_W, cardH),
         BackgroundColor3 = Theme.win,
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
@@ -530,28 +570,15 @@ function UI.Notify(cfg)
     local edge = stroke(card, Theme.line)
     edge.Transparency = 1
 
-    new("UIPadding", {
-        PaddingTop = UDim.new(0, 10),
-        PaddingBottom = UDim.new(0, 10),
-        PaddingLeft = UDim.new(0, 12),
-        PaddingRight = UDim.new(0, 12),
-    }, card)
-
-    new("UIListLayout", {
-        Padding = UDim.new(0, 3),
-        SortOrder = Enum.SortOrder.LayoutOrder,
-    }, card)
-
     -- collected so fadeTo() can animate everything together
     local texts = {}
 
-    if cfg.Title then
+    if titleStr then
         texts[#texts + 1] = new("TextLabel", {
-            LayoutOrder = 1,
-            Size = UDim2.new(1, 0, 0, 0),
-            AutomaticSize = Enum.AutomaticSize.Y,
+            Size = UDim2.fromOffset(NOTIFY_TEXT_W, titleH),
+            Position = UDim2.fromOffset(NOTIFY_PAD_X, NOTIFY_PAD_Y),
             BackgroundTransparency = 1,
-            Text = tostring(cfg.Title),
+            Text = titleStr,
             Font = Theme.fontMedium,
             TextSize = Theme.textSize,
             TextColor3 = Theme.text,
@@ -563,21 +590,22 @@ function UI.Notify(cfg)
         }, card)
     end
 
-    texts[#texts + 1] = new("TextLabel", {
-        LayoutOrder = 2,
-        Size = UDim2.new(1, 0, 0, 0),
-        AutomaticSize = Enum.AutomaticSize.Y,
-        BackgroundTransparency = 1,
-        Text = tostring(cfg.Text or ""),
-        Font = Theme.font,
-        TextSize = 11,
-        TextColor3 = Theme.text2,
-        TextTransparency = 1,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        TextYAlignment = Enum.TextYAlignment.Top,
-        TextWrapped = true,
-        ZIndex = 802,
-    }, card)
+    if bodyStr ~= "" then
+        texts[#texts + 1] = new("TextLabel", {
+            Size = UDim2.fromOffset(NOTIFY_TEXT_W, bodyH),
+            Position = UDim2.fromOffset(NOTIFY_PAD_X, NOTIFY_PAD_Y + titleH + gapH),
+            BackgroundTransparency = 1,
+            Text = bodyStr,
+            Font = Theme.font,
+            TextSize = 11,
+            TextColor3 = Theme.text2,
+            TextTransparency = 1,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextYAlignment = Enum.TextYAlignment.Top,
+            TextWrapped = true,
+            ZIndex = 802,
+        }, card)
+    end
 
     local closed = false
 
@@ -662,7 +690,7 @@ local function cpApplyColor(c, fire)
     end
     if fire and cpCallback then
         local ok, err = pcall(cpCallback, c)
-        if not ok then warn("[AIgui] colorpicker: " .. tostring(err)) end
+        if not ok then reportError("colorpicker", err) end
     end
 end
 
@@ -858,7 +886,7 @@ local function openMultiDropdown(anchor, values, selected, onToggle)
             mark.Text = selected[i] and "✓" or ""
             if onToggle then
                 local ok, err = pcall(onToggle, tostring(v), i, selected[i])
-                if not ok then warn("[AIgui] multiselect: " .. tostring(err)) end
+                if not ok then reportError("multiselect", err) end
             end
         end)
     end
@@ -1190,7 +1218,7 @@ function Window:Toggle(cfg)
         tween(knob, 0.15, { Position = v and UDim2.fromOffset(15, 2) or UDim2.fromOffset(2, 2) })
         if fire and cfg.Callback then
             local ok, err = pcall(cfg.Callback, v)
-            if not ok then warn("[AIgui] toggle: " .. tostring(err)) end
+            if not ok then reportError("toggle", err) end
         end
     end
 
@@ -1303,7 +1331,7 @@ function Window:Slider(cfg)
         valLabel.Text = tostring(v) .. suf
         if fire and cfg.Callback then
             local ok, err = pcall(cfg.Callback, v)
-            if not ok then warn("[AIgui] slider: " .. tostring(err)) end
+            if not ok then reportError("slider", err) end
         end
     end
 
@@ -1406,7 +1434,7 @@ function Window:Select(cfg)
         label.Text = tostring(v)
         if cfg.Callback then
             local ok, err = pcall(cfg.Callback, v, i)
-            if not ok then warn("[AIgui] select: " .. tostring(err)) end
+            if not ok then reportError("select", err) end
         end
     end
 
@@ -1452,7 +1480,7 @@ function Window:Button(cfg)
     btn.MouseButton1Click:Connect(function()
         if cfg.Callback then
             local ok, err = pcall(cfg.Callback)
-            if not ok then warn("[AIgui] button: " .. tostring(err)) end
+            if not ok then reportError("button", err) end
         end
     end)
     return btn
@@ -1530,7 +1558,7 @@ function Window:Keybind(cfg)
         key.TextColor3 = Theme.text2
         if cfg.Callback then
             local ok, err = pcall(cfg.Callback, input.KeyCode)
-            if not ok then warn("[AIgui] keybind: " .. tostring(err)) end
+            if not ok then reportError("keybind", err) end
         end
     end)
 
@@ -1582,7 +1610,7 @@ function Window:Input(cfg)
     local function fire(enterPressed)
         if cfg.Callback then
             local ok, err = pcall(cfg.Callback, box.Text, enterPressed)
-            if not ok then warn("[AIgui] input: " .. tostring(err)) end
+            if not ok then reportError("input", err) end
         end
     end
 
@@ -1634,7 +1662,7 @@ function Window:ColorPicker(cfg)
             color = c
             if cfg.Callback then
                 local ok, err = pcall(cfg.Callback, c)
-                if not ok then warn("[AIgui] colorpicker: " .. tostring(err)) end
+                if not ok then reportError("colorpicker", err) end
             end
         end)
     end)
@@ -1730,7 +1758,7 @@ function Window:MultiSelect(cfg)
             refresh()
             if cfg.Callback then
                 local ok, err = pcall(cfg.Callback, v, i, on)
-                if not ok then warn("[AIgui] multiselect: " .. tostring(err)) end
+                if not ok then reportError("multiselect", err) end
             end
         end)
     end)
