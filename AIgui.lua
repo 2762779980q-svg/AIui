@@ -1577,9 +1577,18 @@ function Window:Select(cfg)
         openDropdown(btn, values, idx, pick)
     end)
 
+    -- SetValues: replace the option list without firing the callback.
+    -- Needed by dynamic lists (player names that come and go). Firing the
+    -- callback here would make a handler think the user re-picked a value.
     return {
         Set = function(_, i) pick(values[i], i) end,
         Get = function() return values[idx], idx end,
+        GetValues = function() return values end,
+        SetValues = function(_, list)
+            values = list or {}
+            if values[idx] == nil then idx = 1 end
+            label.Text = tostring(values[idx] or "")
+        end,
     }
 end
 
