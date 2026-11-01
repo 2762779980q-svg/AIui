@@ -229,15 +229,29 @@ local mouseUnlocked  = false
 local autoUnlock     = true
 local rightHoldLook  = true    -- hold RMB to look around while the menu is open
 local rightHeld      = false
+-- Latched when RMB is released while we are about to give the cursor back.
+-- InputEnded for the release can arrive AFTER the menu is already closed, so
+-- without this flag the close path restores Default and then the stale
+-- InputEnded handler drags the cursor back to LockCenter - the cursor is then
+-- stuck centred with no crosshair: only the camera moves, the pointer does not.
+local restorePending = false
 local unlockPrio    = Enum.RenderPriority.Last.Value
 local savedBehavior, savedIcon = nil, nil
 local mouseConns   = {}
 local writingMouse = false
+-- true while SetMouseUnlocked(false) is doing its own writes. Both the
+-- MouseBehavior changed-signal handler and the RenderStep bind can fire in the
+-- middle of the restore; without this they immediately undo it.
+local restoringMouse = false
+-- How many times the post-close verification had to re-assert the restore.
+-- Non-zero means something is fighting us; surfaced in GetMouseState().
+local mouseRepairs = 0
 
 -- Named rather than inline, so pcall can take the function itself instead of
 -- allocating a new closure on every Heartbeat tick.
 local function applyMouse()
     if not mouseUnlocked then return end
+    if restoringMouse then return end
 
     -- Compare before writing: assigning the same value still fires the changed
     -- signal, which would re-enter this path through the handlers below.
@@ -264,6 +278,7 @@ end
 
 local function writeMouse()
     if not mouseUnlocked then return end
+    if restoringMouse then return end
     if writingMouse then return end
     writingMouse = true
     pcall(applyMouse)
@@ -305,6 +320,13 @@ local function startHold()
         if input.UserInputType ~= Enum.UserInputType.MouseButton2 then return end
         if not rightHeld then return end
         rightHeld = false
+        -- If the menu was closed while RMB was still down, the close path
+        -- already restored the cursor. Writing again here would re-apply the
+        -- post-hold state and leave the pointer locked. Let the close win.
+        if restorePending or not mouseUnlocked then
+            restorePending = false
+            return
+        end
         writeMouse()
     end)
 
@@ -323,6 +345,21 @@ function UI.SetAutoUnlockMouse(v)
     autoUnlock = v and true or false
 end
 
+-- Force the cursor back to a usable state, whatever happened before.
+-- Use this from a keybind or a button when a game (or a stale event) has left
+-- the pointer locked. Works even if the library thinks it is already locked.
+function UI.ForceRestoreMouse()
+    rightHeld      = false
+    restorePending = true
+    restoringMouse = true
+    pcall(function()
+        UIS.MouseIconEnabled = true
+        UIS.MouseBehavior    = Enum.MouseBehavior.Default
+    end)
+    restoringMouse = false
+    task.defer(function() restorePending = false end)
+end
+
 function UI.SetUnlockPriority(n)
     unlockPrio = n
     if mouseUnlocked then bindRenderStep() end
@@ -339,7 +376,13 @@ end
 
 function UI.SetMouseUnlocked(on)
     on = on and true or false
-    if on == mouseUnlocked then return end
+
+    -- Closing must always run the full restore, even when our own flag already
+    -- says "locked". That early return used to skip the restore entirely: if
+    -- anything had cleared mouseUnlocked while the cursor was still pinned to
+    -- LockCenter, the cursor stayed pinned forever (the reported bug).
+    if on == mouseUnlocked and on then return end
+    local wasUnlocked = mouseUnlocked
     mouseUnlocked = on
 
     if on then
@@ -349,18 +392,76 @@ function UI.SetMouseUnlocked(on)
             savedBehavior = UIS.MouseBehavior
             savedIcon     = UIS.MouseIconEnabled
         end
+        restorePending = false
         startHold()
         writeMouse()
     else
-        -- Detach before writing. Otherwise the restore itself fires the
-        -- changed signal and the handler snaps it straight back to Default.
+        if not wasUnlocked and savedBehavior == nil then
+            -- Nothing was ever recorded and we are not unlocked, so restore is
+            -- still correct to run - just use Default rather than guessing.
+            rightHeld      = false
+            restorePending = true
+            stopHold()
+            restoringMouse = true
+            pcall(function()
+                UIS.MouseIconEnabled = true
+                UIS.MouseBehavior    = Enum.MouseBehavior.Default
+            end)
+            restoringMouse = false
+            pcall(function() RunService:UnbindFromRenderStep(MOUSE_BIND) end)
+            task.defer(function() restorePending = false end)
+            return
+        end
+
+        -- Detach first: the changed-signal handlers would otherwise re-enter
+        -- applyMouse while we are writing the restored values.
         rightHeld = false
+        -- Latch a pending restore so an InputEnded that arrives after this
+        -- point knows the close already won and must not touch the cursor.
+        restorePending = true
         stopHold()
+
+        -- Never fall back to LockCenter, and never restore a recorded value
+        -- that IS LockCenter with the icon hidden - that combination is the
+        -- "cursor stuck in the middle, no crosshair" state itself.
+        local wantBehavior = savedBehavior or Enum.MouseBehavior.Default
+        local wantIcon     = (savedIcon ~= false)
+        if wantBehavior == Enum.MouseBehavior.LockCenter and wantIcon == false then
+            wantBehavior = Enum.MouseBehavior.Default
+            wantIcon     = true
+        end
+
+        restoringMouse = true
         pcall(function()
-            UIS.MouseIconEnabled = (savedIcon ~= false)
-            UIS.MouseBehavior    = savedBehavior or Enum.MouseBehavior.LockCenter
+            UIS.MouseIconEnabled = wantIcon
+            UIS.MouseBehavior    = wantBehavior
         end)
+        restoringMouse = false
+
         savedBehavior, savedIcon = nil, nil
+
+        -- Unbind once more: stopHold already did, but a bind created between
+        -- the two calls (resolution change, SetUnlockPriority) would survive.
+        pcall(function() RunService:UnbindFromRenderStep(MOUSE_BIND) end)
+
+        -- Verify on the next frame. A stale InputEnded, a late RenderStep tick
+        -- or the game's own writer can undo the restore; re-assert once and
+        -- then give up (retrying forever would fight a game that legitimately
+        -- wants LockCenter, e.g. first person).
+        task.defer(function()
+            restorePending = false
+            if mouseUnlocked then return end
+            local b, i = UIS.MouseBehavior, UIS.MouseIconEnabled
+            if b ~= wantBehavior or i ~= wantIcon then
+                restoringMouse = true
+                pcall(function()
+                    UIS.MouseIconEnabled = wantIcon
+                    UIS.MouseBehavior    = wantBehavior
+                end)
+                restoringMouse = false
+                mouseRepairs = mouseRepairs + 1
+            end
+        end)
     end
 end
 
@@ -371,13 +472,20 @@ end
 -- Diagnostics: useful when a game refuses to release the cursor.
 function UI.GetMouseState()
     return {
-        unlocked    = mouseUnlocked,
-        behavior    = UIS.MouseBehavior,
-        iconEnabled = UIS.MouseIconEnabled,
-        auto        = autoUnlock,
-        rightHeld   = rightHeld,
-        rightLook   = rightHoldLook,
-        priority    = unlockPrio,
+        unlocked      = mouseUnlocked,
+        behavior      = UIS.MouseBehavior,
+        iconEnabled   = UIS.MouseIconEnabled,
+        auto          = autoUnlock,
+        rightHeld     = rightHeld,
+        rightLook     = rightHoldLook,
+        priority      = unlockPrio,
+        -- stuck == true means the exact symptom users report as "cursor is
+        -- pinned to the centre with no crosshair". Should never happen after a
+        -- clean close; if it does, mouseRepairs tells you something fought us.
+        stuck         = (not mouseUnlocked)
+                        and UIS.MouseBehavior == Enum.MouseBehavior.LockCenter
+                        and UIS.MouseIconEnabled == false,
+        repairs       = mouseRepairs,
     }
 end
 
@@ -2091,7 +2199,22 @@ function UI.SetMenuOpen(v)
     else
         -- Always release on close. If auto-unlock was switched off while the
         -- menu was open, skipping this leaves the cursor unlocked forever.
-        UI.SetMouseUnlocked(false)
+        --
+        -- rightHeld is cleared even when the unlock state is already false:
+        -- RMB can be held while the menu is closed, and a leftover true value
+        -- makes the next open's first write jump straight to LockCenter.
+        rightHeld = false
+        if mouseUnlocked then
+            UI.SetMouseUnlocked(false)
+        else
+            -- Not marked unlocked, but the pointer may still be pinned (the
+            -- exact bug this fixes). Make sure the close leaves a usable
+            -- cursor instead of trusting our own bookkeeping.
+            local b, i = UIS.MouseBehavior, UIS.MouseIconEnabled
+            if b == Enum.MouseBehavior.LockCenter or i == false then
+                UI.ForceRestoreMouse()
+            end
+        end
     end
     if not v then closeDropdown() end
 end
@@ -2114,7 +2237,11 @@ function UI.Destroy()
     UI._destroyed = true
     closeDropdown()
     -- Restore the mouse before tearing down the GUI, otherwise it stays unlocked.
+    -- ForceRestoreMouse afterwards is deliberate: SetMouseUnlocked(false) can be
+    -- a no-op if the unlock flag was already cleared while the cursor was still
+    -- pinned, and Destroy is the last chance to give the player a usable cursor.
     pcall(function() UI.SetMouseUnlocked(false) end)
+    pcall(function() UI.ForceRestoreMouse() end)
     for _, win in ipairs(UI.Windows) do
         for _, c in ipairs(win.conns) do
             pcall(function() c:Disconnect() end)
