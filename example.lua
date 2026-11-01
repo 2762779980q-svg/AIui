@@ -168,11 +168,54 @@ local function W(cfg)
 end
 
 --=====================================================================
+--  Group fallback
+--
+--  Window:Group is new. If the build pulled from GitHub is older than this
+--  file, calling w:Group{...} throws "attempt to call missing method 'Group'".
+--  G() returns a real group when the library has one, and otherwise a stand-in
+--  that renders a plain caption and forwards every widget call to the window.
+--  So the demo runs on both builds; on the old one you just lose the box.
+--=====================================================================
+local FORWARD = {
+    "Toggle", "Slider", "Select", "MultiSelect", "ColorPicker",
+    "Input", "Keybind", "Button", "Divider", "Label", "Paragraph",
+}
+
+-- Set when the loaded build had no Group, so the startup notification can say
+-- "you are on an old build" instead of leaving you to notice the missing boxes.
+local usedFallback = false
+
+local function G(w, text)
+    if type(w.Group) == "function" then
+        return w:Group { Text = text }
+    end
+
+    usedFallback = true
+    local g = {}
+
+    local function pass(name)
+        return function(a, ...)
+            -- Colon call passes the group first; a dot call passes the config.
+            if a == g then return w[name](w, ...) end
+            return w[name](w, a, ...)
+        end
+    end
+
+    for _, name in ipairs(FORWARD) do
+        g[name] = pass(name)
+    end
+    function g:Done() end
+
+    if type(w.Label) == "function" then w:Label(text) end
+    return g
+end
+
+--=====================================================================
 --  Window 1: Aim — three groups, the way a real combat tab is shaped
 --=====================================================================
 local aim = W { Title = "Aim", Subtitle = "COMBAT" }
 
-local gAim = aim:Group { Text = "AIM" }
+local gAim = G(aim, "AIM")
 -- Kept around for the self-check window: it proves widget:Set() is silent.
 local tgAim = gAim:Toggle {
     Text = "Silent aim",
@@ -199,7 +242,7 @@ gAim:Done()
 
 -- Second group. In an Obsidian-style menu this would be AddRightGroupbox -
 -- waterfall has one column, so it just continues below.
-local gPre = aim:Group { Text = "PREDICTION" }
+local gPre = G(aim, "PREDICTION")
 gPre:Toggle {
     Text = "Velocity prediction",
     Default = true,
@@ -218,7 +261,7 @@ gPre:Done()
 --=====================================================================
 local trig = W { Title = "Trigger", Subtitle = "COMBAT" }
 
-local gTrig = trig:Group { Text = "TRIGGER" }
+local gTrig = G(trig, "TRIGGER")
 gTrig:Toggle {
     Text = "Enable",
     Default = S.trigOn,
@@ -251,7 +294,7 @@ trig:Paragraph(
 --=====================================================================
 local vis = W { Title = "Visuals", Subtitle = "RENDER" }
 
-local gPlayers = vis:Group { Text = "PLAYERS" }
+local gPlayers = G(vis, "PLAYERS")
 gPlayers:Toggle {
     Text = "Box",
     Default = S.espOn,
@@ -274,7 +317,7 @@ gPlayers:ColorPicker {
 }
 gPlayers:Done()
 
-local gWorld = vis:Group { Text = "WORLD" }
+local gWorld = G(vis, "WORLD")
 gWorld:Button {
     Text = "Clear decals",
     Callback = cb(function() end),
@@ -290,7 +333,7 @@ gWorld:Done()
 --=====================================================================
 local move = W { Title = "Movement", Subtitle = "MISC" }
 
-local gMove = move:Group { Text = "MOVE" }
+local gMove = G(move, "MOVE")
 gMove:Toggle {
     Text = "Speed",
     Default = S.speedOn,
@@ -345,7 +388,7 @@ local port = W { Title = "Porting", Subtitle = "NOTES" }
 
 local firedAtBuild = fired   -- must be 0: nothing may run on create
 
-local gCheck = port:Group { Text = "SELF-CHECK" }
+local gCheck = G(port, "SELF-CHECK")
 gCheck:Button {
     Text = "Run checks",
     Callback = function()
@@ -368,7 +411,7 @@ gCheck:Button {
         -- Height cap: window height must never exceed its own cap.
         local tallest, over = 0, 0
         for _, w in ipairs(windows) do
-            local h = w:GetHeight()
+            local h = type(w.GetHeight) == "function" and w:GetHeight() or 0
             if h > tallest then tallest = h end
             if h > 800 then over = over + 1 end
         end
@@ -378,7 +421,9 @@ gCheck:Button {
             :format((function()
                 local n = 0
                 for _, w in ipairs(windows) do
-                    if w:GetMaxScroll() > 0 then n = n + 1 end
+                    if type(w.GetMaxScroll) == "function" and w:GetMaxScroll() > 0 then
+                        n = n + 1
+                    end
                 end
                 return n
             end)())
@@ -453,6 +498,9 @@ port:Button {
 --=====================================================================
 AIgui.Notify {
     Title = "AIgui",
-    Text = "INSERT toggles the menu. Ctrl + INSERT restores closed windows.",
-    Duration = 5,
+    Text = usedFallback
+        and ("INSERT toggles the menu. Loaded build has no Group() - boxes are "
+             .. "flat. Push AIgui.lua to GitHub to get them.")
+        or "INSERT toggles the menu. Ctrl + INSERT restores closed windows.",
+    Duration = usedFallback and 8 or 5,
 }
