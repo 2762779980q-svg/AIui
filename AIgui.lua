@@ -1153,6 +1153,11 @@ function UI.Window(cfg)
     self.conns     = {}
     self.height    = M.headH
     self.z         = 10
+    -- Max height in px before the body starts scrolling. nil / 0 = unlimited.
+    -- A tab with 36 rows is ~1400px tall, which falls off a 1080p screen, so
+    -- the shim opts in and only tall windows ever pay for the scroll plumbing.
+    self.maxHeight = tonumber(cfg.MaxHeight) or 0
+    self.scrollY   = 0
 
     local w = new("Frame", {
         Name = "nu_" .. self.title,
@@ -1280,13 +1285,24 @@ function UI.Window(cfg)
         end)
     end
 
-    -- content container
+    -- Clip container for the body. Rows are parented to `content` below,
+    -- which is what actually scrolls; `body` only clips.
     self.body = new("Frame", {
         Size = UDim2.new(1, 0, 1, -M.headH),
         Position = UDim2.fromOffset(0, M.headH),
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
+        ClipsDescendants = true,
     }, w)
+
+    -- Scrolling layer. Always present (cost is one Frame) but only offset when
+    -- the window has a MaxHeight and the content overflows.
+    self.content = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 0),
+        Position = UDim2.fromOffset(0, 0),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+    }, self.body)
 
     self.headLine = new("Frame", {
         Size = UDim2.new(1, 0, 0, 1),
@@ -1365,14 +1381,63 @@ function Window:MakeDraggable(head)
             dragging = false
         end
     end)
+
+    ---------------------------------------------------------------
+    --  Wheel scrolling
+    --  Only when the window actually overflows: otherwise every window in the
+    --  library would swallow wheel events that belong to the game.
+    ---------------------------------------------------------------
+    self.conns[#self.conns + 1] = UIS.InputChanged:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.MouseWheel then return end
+        if self:GetMaxScroll() <= 0 then return end
+        if self.collapsed or not w.Visible then return end
+
+        -- Is the pointer over this window? AbsolutePosition is in screen space,
+        -- the same space as input.Position on desktop.
+        local p  = input.Position
+        local ap = w.AbsolutePosition
+        local sz = w.AbsoluteSize
+        if p.X < ap.X or p.X > ap.X + sz.X then return end
+        if p.Y < ap.Y or p.Y > ap.Y + sz.Y then return end
+
+        -- input.Position.Z is the wheel delta: +1 up, -1 down.
+        self:ScrollBy(-input.Position.Z * 48)
+    end)
 end
 
 -----------------------------------------------------------------------
---  Height / collapse
+--  Height / collapse / scroll
 -----------------------------------------------------------------------
 function Window:GetHeight()
     if self.collapsed then return M.headH end
-    return M.headH + self.cursor + M.bodyBot
+    local full = M.headH + self.cursor + M.bodyBot
+    -- MaxHeight caps the visible window; the rest scrolls inside the body.
+    if self.maxHeight and self.maxHeight > 0 and full > self.maxHeight then
+        return self.maxHeight
+    end
+    return full
+end
+
+-- How far the content can be scrolled at most (0 when it fits).
+function Window:GetMaxScroll()
+    if self.collapsed then return 0 end
+    if not (self.maxHeight and self.maxHeight > 0) then return 0 end
+    local need = M.headH + self.cursor + M.bodyBot
+    local over = need - self.maxHeight
+    return over > 0 and over or 0
+end
+
+function Window:ScrollTo(y)
+    local maxScroll = self:GetMaxScroll()
+    if y < 0 then y = 0 end
+    if y > maxScroll then y = maxScroll end
+    if y == self.scrollY then return end
+    self.scrollY = y
+    self.content.Position = UDim2.fromOffset(0, -y)
+end
+
+function Window:ScrollBy(dy)
+    self:ScrollTo(self.scrollY + dy)
 end
 
 function Window:ApplySize()
@@ -1380,6 +1445,48 @@ function Window:ApplySize()
     self.frame.Size    = UDim2.fromOffset(M.winW, self.height)
     self.body.Visible  = not self.collapsed
     self.headLine.Visible = not self.collapsed
+
+    -- Content keeps its natural height; the clipping body is what limits view.
+    self.content.Size = UDim2.new(1, 0, 0, self.cursor + M.bodyBot)
+
+    -- Content may have shrunk (rows removed) or the window may no longer
+    -- overflow, so clamp the current offset instead of leaving a blank gap.
+    local maxScroll = self:GetMaxScroll()
+    if self.scrollY > maxScroll then
+        self.scrollY = maxScroll
+        self.content.Position = UDim2.fromOffset(0, -maxScroll)
+    end
+    self:UpdateScrollHint()
+end
+
+-- A 1px line on the right edge showing how far down the content is.
+function Window:UpdateScrollHint()
+    local maxScroll = self:GetMaxScroll()
+    if not self.hint then
+        if maxScroll <= 0 then return end
+        self.hint = new("Frame", {
+            Size = UDim2.new(0, 2, 0, 0),
+            Position = UDim2.new(1, -3, 0, 0),
+            BackgroundColor3 = Theme.accentDim,
+            BackgroundTransparency = 0.35,
+            BorderSizePixel = 0,
+            ZIndex = 60,
+        }, self.body)
+    end
+    if maxScroll <= 0 then
+        self.hint.Visible = false
+        return
+    end
+    self.hint.Visible = true
+    local viewH   = math.max(self.height - M.headH, 1)
+    local totalH  = viewH + maxScroll
+    local barH    = math.max(viewH * (viewH / totalH), 18)
+    local travel  = viewH - barH
+    self.hint.Size = UDim2.new(0, 2, 0, barH)
+    self.hint.Position = UDim2.new(
+        1, -3, 0,
+        travel * (self.scrollY / maxScroll)
+    )
 end
 
 function Window:SetCollapsed(v)
@@ -1404,7 +1511,7 @@ function Window:Row(h)
         Position = UDim2.fromOffset(0, y),
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
-    }, self.body), y
+    }, self.content), y
 end
 
 -----------------------------------------------------------------------
