@@ -159,6 +159,7 @@ local scheduleLayout
 --  Module
 --=====================================================================
 local UI = {}
+UI.VERSION  = "0.9.0"
 UI.Windows  = {}
 -- Menu key. Declared here, not next to the input handler, because the
 -- window close handler (defined further down) puts the key name in a
