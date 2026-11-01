@@ -67,6 +67,8 @@ local Theme = {
     knob        = Color3.fromRGB(255, 255, 255),
     knobEdge    = Color3.fromRGB(196, 196, 204),
 
+    panel       = Color3.fromRGB(248, 248, 250),  -- group box fill
+
     font        = Enum.Font.Gotham,
     fontMedium  = Enum.Font.GothamMedium,
     textSize    = 12,
@@ -89,6 +91,11 @@ local M = {
     bodyBot = 8,
     radius  = 8,
     notifyW = 220,   -- notification card width
+
+    -- Group (boxed section inside a window)
+    groupHeadH  = 22,  -- caption row at the top of the box
+    groupIndent = 10,  -- controls inside a group shift right by this
+    groupGap    = 6,   -- breathing room above/below the box
 }
 
 --=====================================================================
@@ -153,6 +160,11 @@ local scheduleLayout
 --=====================================================================
 local UI = {}
 UI.Windows  = {}
+-- Menu key. Declared here, not next to the input handler, because the
+-- window close handler (defined further down) puts the key name in a
+-- notification. A `local` declared later in the file is invisible to that
+-- closure -- it would resolve to a nil global and print "Ctrl + nil".
+local menuKey = Enum.KeyCode.Insert
 UI.Theme    = Theme
 UI.Metrics  = M
 UI.MenuOpen = true
@@ -1153,10 +1165,24 @@ function UI.Window(cfg)
     self.conns     = {}
     self.height    = M.headH
     self.z         = 10
-    -- Max height in px before the body starts scrolling. nil / 0 = unlimited.
-    -- A tab with 36 rows is ~1400px tall, which falls off a 1080p screen, so
-    -- the shim opts in and only tall windows ever pay for the scroll plumbing.
-    self.maxHeight = tonumber(cfg.MaxHeight) or 0
+    -- Horizontal offset applied to every row. Groups raise it while they are
+    -- building their controls, then restore it.
+    self.indent    = 0
+    -- Max height in px before the body starts scrolling.
+    --   nil  -> AUTO: 78% of the viewport, so a long window can never run off
+    --           the bottom of the screen. This is the common case; a window
+    --           with 30+ rows is ~1500px and 1080p has about 1000px of room.
+    --   0    -> explicitly unlimited (opt out of the cap)
+    --   n    -> exact cap in px
+    self.maxHeight = 0
+    do
+        local mh = cfg.MaxHeight
+        if mh == nil then
+            self.maxHeight = math.max(math.floor(viewport().Y * 0.78), 320)
+        else
+            self.maxHeight = tonumber(mh) or 0
+        end
+    end
     self.scrollY   = 0
 
     local w = new("Frame", {
@@ -1315,6 +1341,17 @@ function UI.Window(cfg)
         close.MouseButton1Click:Connect(function()
             w.Visible = false
             scheduleLayout()
+            -- Closing is reversible, but nothing on screen says so. When the
+            -- last window goes the menu looks permanently dead, so spell out
+            -- the way back.
+            if UI.CountVisible() == 0 and type(UI.Notify) == "function" then
+                pcall(UI.Notify, {
+                    Title    = "AIgui",
+                    Text     = "Every window is closed. Ctrl + " ..
+                               tostring(menuKey.Name) .. " brings them back.",
+                    Duration = 6,
+                })
+            end
         end)
     else
         close.Visible = false
@@ -1390,13 +1427,17 @@ function Window:MakeDraggable(head)
     self.conns[#self.conns + 1] = UIS.InputChanged:Connect(function(input)
         if input.UserInputType ~= Enum.UserInputType.MouseWheel then return end
         if self:GetMaxScroll() <= 0 then return end
-        if self.collapsed or not w.Visible then return end
+        -- self.frame, not `w`: `w` is a local of the constructor and does not
+        -- exist in this method. Reading it here hits a nil global and throws on
+        -- the first wheel tick over any window whose content overflows.
+        local frame = self.frame
+        if self.collapsed or not frame.Visible then return end
 
         -- Is the pointer over this window? AbsolutePosition is in screen space,
         -- the same space as input.Position on desktop.
         local p  = input.Position
-        local ap = w.AbsolutePosition
-        local sz = w.AbsoluteSize
+        local ap = frame.AbsolutePosition
+        local sz = frame.AbsoluteSize
         if p.X < ap.X or p.X > ap.X + sz.X then return end
         if p.Y < ap.Y or p.Y > ap.Y + sz.Y then return end
 
@@ -1506,9 +1547,10 @@ end
 
 function Window:Row(h)
     local y = self:Push(h)
+    local ind = self.indent or 0
     return new("Frame", {
-        Size = UDim2.new(1, 0, 0, h),
-        Position = UDim2.fromOffset(0, y),
+        Size = UDim2.new(1, -ind, 0, h),
+        Position = UDim2.fromOffset(ind, y),
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
     }, self.content), y
@@ -1867,6 +1909,113 @@ function Window:Label(text)
         TextColor3 = Theme.text3,
         TextXAlignment = Enum.TextXAlignment.Left,
     }, row)
+end
+
+-----------------------------------------------------------------------
+--  Group
+-----------------------------------------------------------------------
+-- Obsidian-style menus are Tab -> Groupbox -> control. A waterfall window is
+-- flat, so this restores the middle level: a captioned box drawn behind a run
+-- of controls, with those controls indented so the nesting is visible.
+--
+-- Groups do not fold on their own. Folding would mean re-flowing every row
+-- below the group, and AIgui fixes each row's Y at creation time -- shifting
+-- them later fights the layout engine. Collapse the whole window instead
+-- (Window:SetCollapsed), which is what the waterfall layout is built for.
+function Window:Group(cfg)
+    if type(cfg) == "string" then cfg = { Text = cfg } end
+    cfg = cfg or {}
+
+    local win = self
+    win:Push(M.groupGap)
+
+    local top = win.cursor
+
+    -- Panel first, so it renders behind every row created after it.
+    local panel = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 0),
+        Position = UDim2.fromOffset(0, top),
+        BackgroundColor3 = Theme.panel,
+        BorderSizePixel = 0,
+        ZIndex = 0,
+    }, win.content)
+    corner(panel, 6)
+    stroke(panel, Theme.line, 1)
+
+    -- Caption. Deliberately not indented: it labels the whole box.
+    local headY = win.cursor
+    win:Push(M.groupHeadH)
+
+    new("Frame", {
+        Size = UDim2.new(0, 2, 0, M.groupHeadH - 6),
+        Position = UDim2.fromOffset(8, headY + 3),
+        BackgroundColor3 = Theme.accentDim,
+        BorderSizePixel = 0,
+    }, win.content)
+
+    new("TextLabel", {
+        Size = UDim2.new(1, -30, 0, M.groupHeadH),
+        Position = UDim2.fromOffset(16, headY),
+        BackgroundTransparency = 1,
+        Text = tostring(cfg.Text or ""),
+        Font = Theme.fontMedium,
+        TextSize = Theme.textSizeSm,
+        TextColor3 = Theme.text3,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, win.content)
+
+    local g = {}
+
+    local function grow()
+        panel.Size = UDim2.new(1, 0, 0, win.cursor - top)
+    end
+    grow()
+
+    -- Every control built through the group goes through here: raise the
+    -- indent, build, restore. pcall keeps the indent from leaking if a
+    -- constructor throws, then the error is re-raised untouched.
+    local function inside(fn, ...)
+        local old = win.indent
+        win.indent = M.groupIndent
+        local ok, a, b = pcall(fn, ...)
+        win.indent = old
+        if not ok then error(a, 0) end
+        grow()
+        return a, b
+    end
+
+    -- Both `g:Toggle{...}` and `g.Toggle{...}` work; the library's own style is
+    -- the colon form, but dot-calls are a common slip and should not silently
+    -- pass the group itself as the config table.
+    local function bind(fn)
+        return function(a, ...)
+            if a == g then return inside(fn, ...) end
+            return inside(fn, a, ...)
+        end
+    end
+
+    g.Panel       = panel
+    g.Toggle      = bind(function(c) return win:Toggle(c) end)
+    g.Slider      = bind(function(c) return win:Slider(c) end)
+    g.Select      = bind(function(c) return win:Select(c) end)
+    g.MultiSelect = bind(function(c) return win:MultiSelect(c) end)
+    g.ColorPicker = bind(function(c) return win:ColorPicker(c) end)
+    g.Input       = bind(function(c) return win:Input(c) end)
+    g.Keybind     = bind(function(c) return win:Keybind(c) end)
+    g.Button      = bind(function(c) return win:Button(c) end)
+    g.Divider     = bind(function() return win:Divider() end)
+    g.Label       = bind(function(t) return win:Label(t) end)
+    g.Paragraph   = bind(function(t, lines) return win:Paragraph(t, lines) end)
+
+    -- Optional footer padding, so the next section does not touch the box.
+    function g:Done()
+        win:Push(M.groupGap)
+        grow()
+        return g
+    end
+
+    return g
 end
 
 -----------------------------------------------------------------------
@@ -2270,6 +2419,33 @@ function UI.ShowAll()
     UI.Arrange()
 end
 
+-- How many windows are currently on screen.
+function UI.CountVisible()
+    local n = 0
+    for _, win in ipairs(UI.Windows) do
+        if win.frame.Visible then n = n + 1 end
+    end
+    return n
+end
+
+-- Bring back every window that was closed with the X, leaving collapse state
+-- and manually dragged positions alone. Returns how many were restored.
+--
+-- The X used to be a one-way door: it only sets Visible = false, and once the
+-- window is gone there is no control on screen that can bring it back. This is
+-- the way out of that state (also bound to Ctrl + menu key).
+function UI.RestoreWindows()
+    local n = 0
+    for _, win in ipairs(UI.Windows) do
+        if not win.frame.Visible then
+            win.frame.Visible = true
+            n = n + 1
+        end
+    end
+    if n > 0 then UI.Relayout() end
+    return n
+end
+
 --=====================================================================
 --  Theme / metrics overrides
 --=====================================================================
@@ -2290,7 +2466,7 @@ end
 --=====================================================================
 --  Toggle / menu key
 --=====================================================================
-local menuKey = Enum.KeyCode.Insert
+-- menuKey is declared above (module section) so early closures can read it.
 
 function UI.SetKey(k)
     if typeof(k) == "EnumItem" then menuKey = k end
@@ -2332,9 +2508,30 @@ end
 
 UIS.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed then return end
-    if input.KeyCode == menuKey then
-        UI.ToggleMenu()
+    if input.KeyCode ~= menuKey then return end
+
+    -- Ctrl + menu key: bring back every window closed with the X.
+    -- Without this the X is a one-way door -- the window keeps its widgets and
+    -- values, but nothing on screen can reopen it.
+    if UIS:IsKeyDown(Enum.KeyCode.LeftControl) or UIS:IsKeyDown(Enum.KeyCode.RightControl) then
+        local n = UI.RestoreWindows()
+        if n > 0 then
+            if not UI.MenuOpen then UI.SetMenuOpen(true) end
+        else
+            UI.ShowAll()
+        end
+        return
     end
+
+    -- Safety net: never open the menu onto an empty screen. If every window has
+    -- been closed, this key restores them instead of toggling nothing.
+    if not UI.MenuOpen and #UI.Windows > 0 and UI.CountVisible() == 0 then
+        UI.RestoreWindows()
+        UI.SetMenuOpen(true)
+        return
+    end
+
+    UI.ToggleMenu()
 end)
 
 --=====================================================================
