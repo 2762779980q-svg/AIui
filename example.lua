@@ -121,6 +121,8 @@ do
             ShowAll            = function() end,
             RestoreWindows     = function() return 0 end,
             CountVisible       = function() return 0 end,
+            QuickMenu          = function() end,
+            IsPointerOverWindow = function() return false end,
             LastError = "AIgui failed to load",
         }
     end
@@ -494,6 +496,36 @@ port:Button {
 }
 
 --=====================================================================
+--  Quick menu: right-button TAP pops it up beside the cursor
+--
+--  The trigger deliberately coexists with "hold RMB to look around":
+--  tap = popup, hold = view lock, over a window = neither.
+--  Toggle applies on click and closes; Hold is active while held.
+--=====================================================================
+if type(AIgui.QuickMenu) == "function" then
+    AIgui.QuickMenu {
+        Key = Enum.UserInputType.MouseButton2,
+        Items = {
+            {
+                Type = "Toggle",
+                Text = "Silent aim",
+                Default = S.aimOn,
+                Get = function() return S.aimOn end,
+                Callback = function(v)
+                    S.aimOn = v
+                    tgAim:Set(v)   -- keep the widget in the Aim window in sync
+                end,
+            },
+            {
+                Type = "Hold",
+                Text = "Hold aim",
+                Callback = function(v) S.holdAim = v end,
+            },
+        },
+    }
+end
+
+--=====================================================================
 --  Startup
 --=====================================================================
 AIgui.Notify {
@@ -501,6 +533,6 @@ AIgui.Notify {
     Text = usedFallback
         and ("INSERT toggles the menu. Loaded build has no Group() - boxes are "
              .. "flat. Push AIgui.lua to GitHub to get them.")
-        or "INSERT toggles the menu. Ctrl + INSERT restores closed windows.",
+        or "INSERT toggles. Ctrl + INSERT restores. RMB tap = quick menu.",
     Duration = usedFallback and 8 or 5,
 }

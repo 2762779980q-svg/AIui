@@ -96,6 +96,11 @@ local M = {
     groupHeadH  = 22,  -- caption row at the top of the box
     groupIndent = 10,  -- controls inside a group shift right by this
     groupGap    = 6,   -- breathing room above/below the box
+
+    -- false = clicks outside windows pass through to the game while the menu
+    -- is open (a shooter keeps shooting when you click beside the UI).
+    -- true  = the old behaviour: the full-screen blocker eats everything.
+    blockOutsideClicks = false,
 }
 
 --=====================================================================
@@ -321,11 +326,14 @@ local function startHold()
     end)
 
     -- Right button: temporarily hand the cursor back to the game so the camera
-    -- can turn. gameProcessed is deliberately ignored - holding RMB on top of a
-    -- window should still let you look around.
+    -- can turn. Only when the pointer is NOT over a window - holding RMB on
+    -- top of the UI used to yank the cursor to the centre mid-interaction,
+    -- which made windows feel like they were fighting you.
+    -- gameProcessed is still ignored: the pointer-over test is the precise one.
     mouseConns[#mouseConns + 1] = UIS.InputBegan:Connect(function(input)
         if not mouseUnlocked or not rightHoldLook then return end
         if input.UserInputType ~= Enum.UserInputType.MouseButton2 then return end
+        if UI.IsPointerOverWindow() then return end
         rightHeld = true
         writeMouse()
     end)
@@ -1194,6 +1202,10 @@ function UI.Window(cfg)
         BorderSizePixel = 0,
         ClipsDescendants = true,
         ZIndex = 10,
+        -- Sinks clicks that land anywhere on the window, including on plain
+        -- labels and padding. Without this, pass-through mode (the blocker
+        -- being off) would let game clicks through the non-button areas.
+        Active = true,
     }, gui)
     corner(w, M.radius)
     self.winStroke = stroke(w, Theme.line)
@@ -2448,6 +2460,224 @@ function UI.RestoreWindows()
 end
 
 --=====================================================================
+--  Pointer hit-testing
+--=====================================================================
+-- Forward declaration: the quick menu below fills this in, but the pointer
+-- test has to be able to see the variable, so it lives up here.
+local qm        = nil   -- built popup { frame, hide, visible, w, h }
+local qmKey     = nil   -- Enum.KeyCode.* or Enum.UserInputType.*
+local qmPress   = nil   -- clock of the trigger going down (tap detection)
+local QM_TAP    = 0.25  -- press shorter than this counts as a tap
+
+-- True when the cursor is over any visible window (or the quick menu).
+-- Drives two behaviours: RMB look-around is suppressed over windows, and the
+-- quick-menu trigger refuses to fire there.
+--
+-- GetMouseLocation and AbsolutePosition share the same origin here, because
+-- the root ScreenGui is IgnoreGuiInset = true: both are measured from the very
+-- top-left of the screen, not from below the topbar.
+function UI.IsPointerOverWindow()
+    local m = UIS:GetMouseLocation()
+    local mx, my = m.X, m.Y
+    for _, win in ipairs(UI.Windows) do
+        local f = win.frame
+        if f.Visible then
+            local p, s = f.AbsolutePosition, f.AbsoluteSize
+            if mx >= p.X and mx <= p.X + s.X and my >= p.Y and my <= p.Y + s.Y then
+                return true
+            end
+        end
+    end
+    if qm and qm.visible then return true end
+    return false
+end
+
+--=====================================================================
+--  Quick menu
+--=====================================================================
+-- A small popup summoned by a hotkey, appearing to the right of the cursor.
+-- Built for reaching one or two features without opening the whole menu:
+--
+--   AIgui.QuickMenu {
+--       Key = Enum.UserInputType.MouseButton2,
+--       Items = {
+--           { Type = "Toggle", Text = "Silent aim", Callback = function(v) end },
+--           { Type = "Hold",   Text = "Hold aim",   Callback = function(v) end },
+--       },
+--   }
+--
+-- Interaction rules, chosen to coexist with "hold RMB to look around":
+--   * a quick tap of the trigger key opens the popup
+--   * a long hold keeps doing whatever the game does with it (view lock)
+--   * over a window the trigger does nothing at all
+--   * Toggle item: click applies and the popup closes
+--   * Hold item:   active while held, release closes the popup
+--   * trigger pressed again, a click outside windows, or closing the menu
+--     all dismiss it
+--=====================================================================
+function UI.QuickMenu(cfg)
+    if type(cfg) ~= "table" or typeof(cfg.Key) ~= "EnumItem" then return end
+    qmKey = cfg.Key
+
+    local items = cfg.Items or {}
+    local pad, rowH, width = 6, 26, 148
+    local height = pad * 2 + #items * rowH
+
+    local frame = new("Frame", {
+        Size = UDim2.fromOffset(width, height),
+        Visible = false,
+        Active = true,          -- sink clicks that land on the popup
+        ZIndex = 80,
+        BackgroundColor3 = Theme.win,
+        BorderSizePixel = 0,
+    }, gui)
+    corner(frame, M.radius)
+    stroke(frame, Theme.line, 1)
+
+    local st = { frame = frame, visible = false, w = width, h = height }
+    local refreshers = {}   -- re-read each item's state right before showing
+
+    function st.hide()
+        st.visible = false
+        frame.Visible = false
+    end
+
+    function st.show()
+        for _, fn in ipairs(refreshers) do fn() end
+        local vp = viewport()
+        local m = UIS:GetMouseLocation()
+        local x = m.X + 14
+        if x + width > vp.X - 4 then x = m.X - 14 - width end
+        local y = m.Y - 10
+        if y + height > vp.Y - 4 then y = vp.Y - 4 - height end
+        if y < 4 then y = 4 end
+        frame.Position = UDim2.fromOffset(math.floor(x), math.floor(y))
+        st.visible = true
+        frame.Visible = true
+    end
+
+    for i, item in ipairs(items) do
+        item = item or {}
+        local isHold = item.Type == "Hold"
+        local on = item.Default and true or false
+
+        local row = new("TextButton", {
+            Size = UDim2.new(1, -8, 0, rowH - 4),
+            Position = UDim2.fromOffset(4, pad + (i - 1) * rowH),
+            BackgroundColor3 = Theme.ctrl,
+            AutoButtonColor = false,
+            Text = "",
+            ZIndex = 81,
+        }, frame)
+        corner(row, 6)
+
+        new("TextLabel", {
+            Size = UDim2.new(1, -46, 1, 0),
+            Position = UDim2.fromOffset(10, 0),
+            BackgroundTransparency = 1,
+            Text = tostring(item.Text or ""),
+            Font = Theme.font,
+            TextSize = Theme.textSize,
+            TextColor3 = Theme.text,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            ZIndex = 82,
+        }, row)
+
+        -- State marker: filled dot for a toggle, bar for a hold.
+        local mark = new("Frame", {
+            Size = UDim2.fromOffset(isHold and 14 or 10, isHold and 4 or 10),
+            Position = UDim2.new(1, -18, 0.5, isHold and -2 or -5),
+            BackgroundColor3 = on and Theme.accent or Theme.ctrlHover,
+            BorderSizePixel = 0,
+            ZIndex = 82,
+        }, row)
+        if not isHold then corner(mark, 0.5) end
+
+        local function fire(v)
+            if type(item.Callback) == "function" then
+                local ok, err = pcall(item.Callback, v)
+                if not ok then reportError("quickmenu", err) end
+            end
+        end
+
+        -- If the script provides Get(), the marker re-syncs on every popup, so
+        -- toggling the same feature from a window does not desync the dot.
+        if type(item.Get) == "function" then
+            refreshers[#refreshers + 1] = function()
+                local ok, v = pcall(item.Get)
+                if ok and type(v) == "boolean" and v ~= on then
+                    on = v
+                    mark.BackgroundColor3 = on and Theme.accent or Theme.ctrlHover
+                end
+            end
+        end
+
+        if isHold then
+            row.MouseButton1Down:Connect(function()
+                mark.BackgroundColor3 = Theme.accent
+                fire(true)
+            end)
+            row.MouseButton1Up:Connect(function()
+                mark.BackgroundColor3 = Theme.ctrlHover
+                fire(false)
+                st.hide()   -- "hold" is a one-shot: release applies and closes
+            end)
+        else
+            row.MouseButton1Click:Connect(function()
+                on = not on
+                mark.BackgroundColor3 = on and Theme.accent or Theme.ctrlHover
+                fire(on)
+                st.hide()   -- "click to dismiss"
+            end)
+        end
+    end
+
+    qm = st
+end
+
+local function qmMatches(input)
+    if not qmKey or typeof(qmKey) ~= "EnumItem" then return false end
+    if qmKey.EnumType == Enum.UserInputType then
+        return input.UserInputType == qmKey
+    end
+    return input.KeyCode == qmKey
+end
+
+UIS.InputBegan:Connect(function(input, gameProcessed)
+    if not qmKey or not UI.MenuOpen then return end
+    if not qmMatches(input) then return end
+
+    -- Trigger again while open: just close it, do not re-arm tap detection,
+    -- otherwise the release would immediately reopen it.
+    if qm and qm.visible then
+        qm.hide()
+        qmPress = nil
+        return
+    end
+
+    if UI.IsPointerOverWindow() then return end
+    qmPress = os.clock()
+end)
+
+UIS.InputEnded:Connect(function(input)
+    if not qmPress or not qmMatches(input) then return end
+    local dt = os.clock() - qmPress
+    qmPress = nil
+    if dt <= QM_TAP and qm and not qm.visible then
+        qm.show()
+    end
+end)
+
+-- A left click that the game receives (gameProcessed == false) dismisses the
+-- popup. Clicks on the popup's own buttons are gameProcessed, so they do not.
+UIS.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+    if qm and qm.visible then qm.hide() end
+end)
+
+--=====================================================================
 --  Theme / metrics overrides
 --=====================================================================
 function UI.SetTheme(tbl)
@@ -2477,7 +2707,12 @@ function UI.SetMenuOpen(v)
     v = v and true or false
     UI.MenuOpen = v
     gui.Enabled    = v
-    blocker.Visible = v
+    -- Click-through by default: windows sink their own clicks (Active = true),
+    -- so the full-screen blocker is only needed when that behaviour is turned
+    -- off, or when no window exists yet (a menu with nothing in it would
+    -- otherwise forward every click into the game).
+    blocker.Visible = v and (#UI.Windows == 0 or M.blockOutsideClicks)
+    if qm and qm.hide then qm.hide() end
     if v then
         if autoUnlock then UI.SetMouseUnlocked(true) end
     else
