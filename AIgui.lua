@@ -101,6 +101,16 @@ local M = {
     -- is open (a shooter keeps shooting when you click beside the UI).
     -- true  = the old behaviour: the full-screen blocker eats everything.
     blockOutsideClicks = false,
+
+    -- Engine-level mouse unlock (the Obsidian trick): a zero-size Modal button
+    -- forces the pointer free at the end of every frame, after any script's
+    -- LockCenter write. No script-side MouseBehaviour race at all.
+    -- false falls back to the three-layer write fight.
+    modalUnlock = true,
+
+    -- Draw a crosshair that follows the pointer while the menu is open and
+    -- hide the native icon. false = keep the OS cursor.
+    customCursor = true,
 }
 
 --=====================================================================
@@ -223,6 +233,50 @@ local blocker = new("TextButton", {
 }, gui)
 
 --=====================================================================
+--  Engine-level unlock + custom crosshair
+--=====================================================================
+-- Zero-size Modal button: it can never be hovered or clicked, so it swallows
+-- nothing, but while `Modal` is true the engine forces the pointer free at the
+-- end of every frame - after any script's LockCenter write. The unlock stops
+-- being a script-side race; the only case that still writes MouseBehaviour is
+-- deliberately handing the camera over (RMB hold-to-look).
+--
+-- Zero-size Modal unlocking is what Linoria/Obsidian have shipped for years,
+-- but it is not a documented guarantee (the docs say Modal unlocks on hover,
+-- and a zero-size button is never hovered). M.modalUnlock = false falls back
+-- to the write-based behaviour if the engine ever changes.
+local modalEl = new("TextButton", {
+    Size = UDim2.fromScale(0, 0),
+    BackgroundTransparency = 1,
+    Text = "",
+    Modal = false,
+    ZIndex = -999,
+}, gui)
+
+-- Crosshair drawn inside the GUI, following the pointer. Shown while the menu
+-- is open and the camera is not held; the native icon is hidden meanwhile and
+-- re-asserted every frame from the same RenderStep that drives the mouse, so
+-- the game cannot permanently hide either.
+local cursorH = new("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Size = UDim2.fromOffset(11, 1),
+    BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+    BorderSizePixel = 0,
+    Visible = false,
+    ZIndex = 999,
+}, gui)
+local cursorV = new("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Size = UDim2.fromOffset(1, 11),
+    BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+    BorderSizePixel = 0,
+    Visible = false,
+    ZIndex = 999,
+}, gui)
+stroke(cursorH, Color3.fromRGB(60, 60, 66), 1)
+stroke(cursorV, Color3.fromRGB(60, 60, 66), 1)
+
+--=====================================================================
 --  Mouse unlocking
 --
 --  Why setting MouseBehavior once does not work:
@@ -271,20 +325,31 @@ local function applyMouse()
     if not mouseUnlocked then return end
     if restoringMouse then return end
 
-    -- Compare before writing: assigning the same value still fires the changed
-    -- signal, which would re-enter this path through the handlers below.
     if rightHeld and rightHoldLook then
-        -- Right button held: snap back to LockCenter. The game camera only
-        -- receives mouse delta while the cursor is centred, so this is what
-        -- makes "hold right button to look around" work with the menu open.
-        -- The cursor parks itself in the middle of the screen on release.
+        -- Hand the camera over. Modal must go FIRST: while it is true the
+        -- engine would override our LockCenter at the end of the frame. With
+        -- Modal off, the game's own camera controller re-locks every frame and
+        -- we do not have to win that race at all.
+        if modalEl.Modal then modalEl.Modal = false end
         if UIS.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
             UIS.MouseBehavior = Enum.MouseBehavior.LockCenter
         end
         if UIS.MouseIconEnabled then
             UIS.MouseIconEnabled = false
         end
+    elseif M.modalUnlock then
+        -- Normal unlocked state, engine-driven. The behaviour property is
+        -- deliberately NOT written here: that write was the entire race this
+        -- library used to have with the game's camera controller. Modal wins
+        -- it at the engine level instead. We only keep the pointer visible.
+        if not modalEl.Modal then modalEl.Modal = true end
+        local wantIcon = not M.customCursor
+        if UIS.MouseIconEnabled ~= wantIcon then
+            UIS.MouseIconEnabled = wantIcon
+        end
     else
+        -- Fallback: the old write-based unlock.
+        if modalEl.Modal then modalEl.Modal = false end
         if UIS.MouseBehavior ~= Enum.MouseBehavior.Default then
             UIS.MouseBehavior = Enum.MouseBehavior.Default
         end
@@ -307,7 +372,22 @@ local function bindRenderStep()
     pcall(function() RunService:UnbindFromRenderStep(MOUSE_BIND) end)
     pcall(function()
         RunService:BindToRenderStep(MOUSE_BIND, unlockPrio, function()
-            if mouseUnlocked then writeMouse() end
+            if not mouseUnlocked then return end
+            writeMouse()
+
+            -- Crosshair follows the pointer; hidden while the camera is held
+            -- (RMB), because the pointer is pinned to the centre anyway.
+            local show = M.customCursor and not rightHeld
+            if show then
+                local m = UIS:GetMouseLocation()
+                local p = UDim2.fromOffset(m.X, m.Y)
+                cursorH.Position = p
+                cursorV.Position = p
+            end
+            if cursorH.Visible ~= show then
+                cursorH.Visible = show
+                cursorV.Visible = show
+            end
         end)
     end)
 end
@@ -360,6 +440,10 @@ local function stopHold()
     end
     table.clear(mouseConns)
     pcall(function() RunService:UnbindFromRenderStep(MOUSE_BIND) end)
+    -- The bind above was the only thing keeping the crosshair on screen.
+    cursorH.Visible = false
+    cursorV.Visible = false
+    if modalEl.Modal then modalEl.Modal = false end
 end
 
 function UI.SetAutoUnlockMouse(v)
@@ -374,6 +458,9 @@ function UI.ForceRestoreMouse()
     restorePending = true
     restoringMouse = true
     pcall(function()
+        -- Modal would override the Default write at frame end, so it has to
+        -- go first. The next writeMouse re-asserts it if the menu is open.
+        if modalEl.Modal then modalEl.Modal = false end
         UIS.MouseIconEnabled = true
         UIS.MouseBehavior    = Enum.MouseBehavior.Default
     end)
@@ -393,6 +480,18 @@ function UI.SetRightHoldLook(v)
         rightHeld = false
         writeMouse()
     end
+end
+
+-- Toggle the in-GUI crosshair. When it is on, the native pointer icon is kept
+-- hidden while the menu is open; the crosshair follows the real pointer, so
+-- this is purely cosmetic and cannot drift from where clicks land.
+function UI.SetCustomCursor(v)
+    M.customCursor = v and true or false
+    if not M.customCursor then
+        cursorH.Visible = false
+        cursorV.Visible = false
+    end
+    if mouseUnlocked then writeMouse() end
 end
 
 function UI.SetMouseUnlocked(on)
@@ -507,6 +606,9 @@ function UI.GetMouseState()
                         and UIS.MouseBehavior == Enum.MouseBehavior.LockCenter
                         and UIS.MouseIconEnabled == false,
         repairs       = mouseRepairs,
+        modal         = modalEl.Modal,
+        modalUnlock   = M.modalUnlock,
+        customCursor  = M.customCursor,
     }
 end
 
