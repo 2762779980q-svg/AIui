@@ -174,13 +174,23 @@ local scheduleLayout
 --  Module
 --=====================================================================
 local UI = {}
-UI.VERSION  = "0.9.0"
+UI.VERSION  = "0.9.1"
 UI.Windows  = {}
 -- Menu key. Declared here, not next to the input handler, because the
 -- window close handler (defined further down) puts the key name in a
 -- notification. A `local` declared later in the file is invisible to that
 -- closure -- it would resolve to a nil global and print "Ctrl + nil".
 local menuKey = Enum.KeyCode.Insert
+
+-- While a Keybind widget is capturing a new key, the menu key must not also
+-- fire. Both listen on UserInputService.InputBegan, so without this counter,
+-- rebinding to the menu key closes the menu at the same moment.
+local capturing = 0
+
+-- Keybinds that actually do something (Mode = "Toggle" / "Hold" / "Always").
+-- A Keybind without Mode stays a pure picker: it only records the key and lets
+-- the script decide what to do with it.
+local keybinds = {}
 UI.Theme    = Theme
 UI.Metrics  = M
 UI.MenuOpen = true
@@ -318,6 +328,9 @@ local restoringMouse = false
 -- How many times the post-close verification had to re-assert the restore.
 -- Non-zero means something is fighting us; surfaced in GetMouseState().
 local mouseRepairs = 0
+-- Set when the engine ignored the zero-size Modal unlock and we dropped back
+-- to writing MouseBehaviour ourselves. Surfaced in GetMouseState().
+local modalFallback = false
 
 -- Named rather than inline, so pcall can take the function itself instead of
 -- allocating a new closure on every Heartbeat tick.
@@ -515,6 +528,21 @@ function UI.SetMouseUnlocked(on)
         restorePending = false
         startHold()
         writeMouse()
+
+        -- Verify the engine actually honoured the Modal unlock. Zero-size
+        -- Modal is a long-lived community trick, not a documented guarantee:
+        -- if it were ignored, the menu would appear with the cursor still
+        -- locked, which looks exactly like "the hotkey stopped working".
+        -- One sample a few frames later; Default means Modal did its job.
+        if M.modalUnlock then
+            task.delay(0.3, function()
+                if not mouseUnlocked or rightHeld then return end
+                if UIS.MouseBehavior == Enum.MouseBehavior.Default then return end
+                modalFallback = true
+                M.modalUnlock = false
+                writeMouse()
+            end)
+        end
     else
         if not wasUnlocked and savedBehavior == nil then
             -- Nothing was ever recorded and we are not unlocked, so restore is
@@ -608,6 +636,7 @@ function UI.GetMouseState()
         repairs       = mouseRepairs,
         modal         = modalEl.Modal,
         modalUnlock   = M.modalUnlock,
+        modalFallback = modalFallback,
         customCursor  = M.customCursor,
     }
 end
@@ -1831,6 +1860,9 @@ function Window:Slider(cfg)
         else
             v = math.floor(v + 0.5)
         end
+        -- Clamp here, not only at the drag site: Set() is public and a script
+        -- passing 5000 would park the knob outside the track.
+        v = math.clamp(v, min, max)
         val = v
         local p = (max > min) and (v - min) / (max - min) or 0
         fill.Size     = UDim2.fromScale(p, 1)
@@ -2165,21 +2197,85 @@ function Window:Keybind(cfg)
     corner(key, 4)
     stroke(key, Theme.line)
 
+    -- cfg.Mode turns this from a picker into a working keybind:
+    --   nil / "None" -> only records the key (Callback gets the key on change)
+    --   "Toggle"     -> press to toggle, Callback(state: boolean)
+    --   "Hold"       -> active while held, Callback(true) / Callback(false)
+    --   "Always"     -> Callback(true) on every press
+    local mode = cfg.Mode
+    if mode == "None" then mode = nil end
+
+    -- pcall the lookup: a typo'd Default ("LeftShift2") must not abort window
+    -- construction with "not a valid member of Enum.KeyCode".
+    local current = nil
+    if type(cfg.Default) == "string" then
+        local ok, code = pcall(function() return Enum.KeyCode[cfg.Default] end)
+        if ok then current = code end
+    elseif typeof(cfg.Default) == "EnumItem" then
+        current = cfg.Default
+    end
+
+    -- Registered even without a Mode: Destroy has to know about it to give
+    -- back the capture counter if the window dies mid-rebind.
+    local entry = { win = self, code = current, mode = mode, state = false,
+                    cb = cfg.Callback, listening = false }
+    keybinds[#keybinds + 1] = entry
+
     local listening = false
 
+    local function paint()
+        key.Text = current and current.Name or "None"
+        key.TextColor3 = Theme.text2
+    end
+    paint()
+
     key.MouseButton1Click:Connect(function()
+        if listening then
+            -- Clicking the box again cancels instead of arming twice (which
+            -- would leak a count into the capture counter and mute the menu
+            -- key forever).
+            listening = false
+            entry.listening = false
+            capturing = math.max(capturing - 1, 0)
+            paint()
+            return
+        end
         listening = true
+        entry.listening = true
+        capturing = capturing + 1
         key.Text = "..."
         key.TextColor3 = Theme.accentDim
     end)
 
-    self.conns[#self.conns + 1] = UIS.InputBegan:Connect(function(input)
+    self.conns[#self.conns + 1] = UIS.InputBegan:Connect(function(input, gameProcessed)
         if not listening then return end
+
+        -- A click anywhere cancels the capture. Without this the widget stays
+        -- armed on "...", and the next key you press anywhere gets eaten.
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.MouseButton2 then
+            listening = false
+            entry.listening = false
+            capturing = math.max(capturing - 1, 0)
+            paint()
+            return
+        end
+
         if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
         listening = false
-        key.Text = input.KeyCode.Name
-        key.TextColor3 = Theme.text2
-        if cfg.Callback then
+        entry.listening = false
+        capturing = math.max(capturing - 1, 0)
+
+        current = input.KeyCode
+        entry.code = input.KeyCode
+        paint()
+
+        if type(cfg.ChangedCallback) == "function" then
+            local ok, err = pcall(cfg.ChangedCallback, input.KeyCode)
+            if not ok then reportError("keybind", err) end
+        elseif not mode and type(cfg.Callback) == "function" then
+            -- Backwards compatible picker: Callback(key) on change.
             local ok, err = pcall(cfg.Callback, input.KeyCode)
             if not ok then reportError("keybind", err) end
         end
@@ -2187,11 +2283,65 @@ function Window:Keybind(cfg)
 
     return {
         Set = function(_, name)
-            key.Text = tostring(name)
+            if typeof(name) == "EnumItem" then
+                current = name
+            elseif type(name) == "string" and name ~= "" and name ~= "None" then
+                local ok, code = pcall(function() return Enum.KeyCode[name] end)
+                current = (ok and code) or nil
+            else
+                current = nil
+            end
+            entry.code = current
+            paint()
         end,
-        Get = function() return key.Text end,
+        Get = function() return current end,
+        GetState = function() return entry.state end,
     }
 end
+
+-----------------------------------------------------------------------
+--  Keybind actions
+-----------------------------------------------------------------------
+-- One listener for every Mode-enabled keybind, instead of one per widget.
+-- Skipped while a rebind is in progress (capturing) and while a textbox has
+-- focus (gameProcessed), which is exactly when a bound key would fire by
+-- accident.
+local function fireBind(entry, v)
+    if type(entry.cb) ~= "function" then return end
+    local ok, err = pcall(entry.cb, v)
+    if not ok then reportError("keybind", err) end
+end
+
+UIS.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed or capturing > 0 then return end
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+    for _, e in ipairs(keybinds) do
+        if e.mode and e.code and input.KeyCode == e.code then
+            if e.mode == "Hold" then
+                if not e.state then
+                    e.state = true
+                    fireBind(e, true)
+                end
+            elseif e.mode == "Always" then
+                fireBind(e, true)
+            else
+                e.state = not e.state
+                fireBind(e, e.state)
+            end
+        end
+    end
+end)
+
+UIS.InputEnded:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    for _, e in ipairs(keybinds) do
+        if e.mode == "Hold" and e.state and e.code and input.KeyCode == e.code then
+            e.state = false
+            fireBind(e, false)
+        end
+    end
+end)
 
 -----------------------------------------------------------------------
 --  Input (single-line textbox)
@@ -2336,12 +2486,16 @@ function Window:MultiSelect(cfg)
     local values  = cfg.Values or {}
     local selected = {}
 
+    -- `selected` is a set keyed by item index. Array defaults are a list of
+    -- indexes (`{1, 3}` = first and third), not index->value pairs: the old
+    -- loop wrote selected[1]=1 and selected[2]=3, which selected items 1 and 2
+    -- and silently ignored the 3.
     if cfg.Default then
-        for i, v in pairs(cfg.Default) do
-            if type(i) == "number" then
-                selected[i] = v
-            elseif type(v) == "number" then
+        for k, v in pairs(cfg.Default) do
+            if type(k) == "number" then
                 selected[v] = true
+            elseif v then
+                selected[k] = true
             end
         end
     end
@@ -2472,6 +2626,17 @@ function Window:Destroy()
         if w == self then
             table.remove(UI.Windows, i)
             break
+        end
+    end
+    -- Drop this window's keybinds. A destroyed window whose bind stayed in the
+    -- list would keep firing, and one that died mid-rebind would hold the
+    -- capture counter above zero, muting the menu key for the rest of the
+    -- session.
+    for i = #keybinds, 1, -1 do
+        local e = keybinds[i]
+        if e.win == self then
+            if e.listening then capturing = math.max(capturing - 1, 0) end
+            table.remove(keybinds, i)
         end
     end
     if self.frame then self.frame:Destroy() end
@@ -2653,7 +2818,23 @@ end
 
 UIS.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed then return end
-    if input.KeyCode ~= menuKey then return end
+
+    -- A Keybind widget is waiting for a key: that key belongs to it, not to
+    -- the menu. Without this, rebinding anything to the menu key would close
+    -- the menu in the same frame the new key was recorded.
+    if capturing > 0 then return end
+
+    -- menuKey can be a KeyCode or a UserInputType (SetKey takes either), so
+    -- compare against the right field instead of always KeyCode. Comparing
+    -- KeyCode against a MouseButton binding never matches, which made the menu
+    -- key silently dead after SetKey(Enum.UserInputType.MouseButton2).
+    local match
+    if typeof(menuKey) == "EnumItem" and menuKey.EnumType == Enum.UserInputType then
+        match = input.UserInputType == menuKey
+    else
+        match = input.KeyCode == menuKey
+    end
+    if not match then return end
 
     -- Ctrl + menu key: bring back every window closed with the X.
     -- Without this the X is a one-way door -- the window keeps its widgets and
@@ -2684,6 +2865,11 @@ end)
 --=====================================================================
 function UI.Destroy()
     UI._destroyed = true
+    -- Without this, keybinds belonging to the destroyed windows stay in the
+    -- list and keep firing callbacks that touch dead GUI objects; a bind that
+    -- was mid-rebind would also leave the capture counter above zero.
+    table.clear(keybinds)
+    capturing = 0
     closeDropdown()
     -- Restore the mouse before tearing down the GUI, otherwise it stays unlocked.
     -- ForceRestoreMouse afterwards is deliberate: SetMouseUnlocked(false) can be
@@ -2753,7 +2939,7 @@ function UI.Demo()
     w:Paragraph("AIgui is a single-file, dependency-free window library. " ..
                 "Windows arrange themselves in a waterfall and can be dragged freely.", 3)
     w:Divider()
-    w:Label("v1.0.0")
+    w:Label("v" .. tostring(UI.VERSION))
     w:Button { Text = "Notify", Callback = function()
         UI.Notify { Title = "AIgui", Text = "This is a notification.", Duration = 3 }
     end }

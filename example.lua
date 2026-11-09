@@ -349,10 +349,35 @@ gMove:Toggle {
     Default = S.flyOn,
     Callback = cb(function(v) S.flyOn = v end),
 }
+-- Mode = nil keeps this a pure picker: Callback receives the key itself, and
+-- the script decides what pressing it does (that is what 快说快说-style menus
+-- need, since they run their own dispatcher).
 gMove:Keybind {
     Text = "Fly key",
     Default = S.hotkey,
     Callback = cb(function(k) S.hotkey = k.Name end),
+}
+
+-- With a Mode the widget is a working keybind: the library watches the key and
+-- drives the callback for you.
+--   "Toggle" -> press flips, Callback(state)
+--   "Hold"   -> active while held, Callback(true) / Callback(false)
+--   "Always" -> Callback(true) on every press
+gMove:Keybind {
+    Text = "Aim (toggle)",
+    Default = "C",
+    Mode = "Toggle",
+    Callback = cb(function(on)
+        S.aimOn = on
+        tgAim:Set(on)          -- keep the Aim window's switch honest
+    end),
+    ChangedCallback = function(k) S.aimKey = k.Name end,
+}
+gMove:Keybind {
+    Text = "Sprint (hold)",
+    Default = "LeftShift",
+    Mode = "Hold",
+    Callback = cb(function(on) S.sprint = on end),
 }
 gMove:Done()
 
@@ -447,8 +472,9 @@ port:Input {
     Text = "Name",
     Default = "",
     Placeholder = "type here",
-    Callback = function(text)
-        -- Fires on every keystroke, so no notification here.
+    Callback = function(text, entered)
+        -- Fires when the box loses focus (entered = true when Enter was hit).
+        -- Not per keystroke, so a cheap side effect here is fine.
     end,
 }
 
